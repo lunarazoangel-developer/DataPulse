@@ -10,6 +10,11 @@ A Streamlit-based data cleaning and optimization application with:
 All backend code is written in English with comprehensive inline documentation.
 """
 
+import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from src.app import DataPulseApp
 
 
