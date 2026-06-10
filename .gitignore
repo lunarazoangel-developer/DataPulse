@@ -8,9 +8,6 @@ venv/
 env/
 .venv
 
-# Streamlit
-.streamlit/secrets.toml
-
 # IDE
 .vscode/
 .idea/
@@ -28,3 +25,10 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Backend
+backend/data/
+
+# Frontend
+frontend/.next/
+frontend/node_modules/

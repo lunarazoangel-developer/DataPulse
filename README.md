@@ -1,6 +1,11 @@
 # DataPulse
 
-A Streamlit-based intelligent data cleaning and anomaly detection application with AI-ready payload generation.
+Intelligent data cleaning and anomaly detection application with AI-ready payload generation.
+
+## Architecture
+
+- **Frontend**: Next.js (React) + Tailwind CSS
+- **Backend**: FastAPI (Python) + Polars
 
 ## Features
 
@@ -12,66 +17,92 @@ A Streamlit-based intelligent data cleaning and anomaly detection application wi
 
 ## Installation
 
+### Backend
+
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/datapulse.git
-cd datapulse
-
-# Create virtual environment (optional but recommended)
+cd backend
 python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
+# Windows: venv\Scripts\activate
+# Linux/Mac: source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Requirements
-
-- Python 3.8+
-- Streamlit
-- Pandas
-- Plotly
-- streamlit-mermaid (optional, for ER diagrams)
-
-Install all dependencies:
+### Frontend
 
 ```bash
-pip install streamlit pandas plotly openpyxl python-levenshtein
-pip install streamlit-mermaid  # Optional
+cd frontend
+npm install
 ```
 
 ## Usage
 
+### Running the Backend
+
 ```bash
-streamlit run app.py
+cd backend
+uvicorn main:app --reload --port 8000
 ```
 
-The application will open in your browser at `http://localhost:8501`.
+The API will be available at `http://localhost:8000`
+
+### Running the Frontend
+
+```bash
+cd frontend
+npm run dev
+```
+
+The application will open in your browser at `http://localhost:3000`
 
 ## How to Use
 
-1. **Upload Data**: Use the sidebar to upload CSV or Excel files
-2. **Explore Relationships**: View database relationships in the "Database Relationships" tab
-3. **Configure Security**: Mark sensitive columns in the "Anomaly Report" tab
+1. **Upload Data**: Use the upload form to upload CSV or Excel files
+2. **Explore Relationships**: View database relationships in the Dashboard tab
+3. **Configure Security**: Mark sensitive columns in the Anomaly Report tab
 4. **Adjust Detection**: Use sliders to tune anomaly detection sensitivity
 5. **Review Anomalies**: See traffic light results (RED/YELLOW/GREEN)
 6. **Export**: Download AI-ready JSON payloads
+
+## API Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/files/upload` | Upload data files |
+| GET | `/api/files/tables` | Get list of loaded tables |
+| DELETE | `/api/files/clear` | Clear all data |
+| GET | `/api/analyze/relationships` | Get table relationships |
+| GET | `/api/analyze/schema` | Get schema analysis |
+| POST | `/api/analyze/anomalies` | Run anomaly detection |
+| GET | `/api/payload/sensitive-columns` | Get sensitive columns |
+| POST | `/api/payload/sensitive-columns` | Update sensitive columns |
+| GET | `/api/payload/preview` | Preview AI payload |
+| GET | `/api/payload/download` | Download AI payload JSON |
 
 ## Project Structure
 
 ```
 datapulse/
-├── app.py                    # Main entry point
-├── src/
+├── backend/                    # FastAPI + Polars
+│   ├── main.py               # Entry point
+│   ├── requirements.txt      # Python dependencies
+│   ├── api/
+│   │   ├── routes/
+│   │   │   ├── files.py     # File upload endpoints
+│   │   │   ├── analyze.py   # Analysis endpoints
+│   │   │   └── payload.py   # Payload generation
+│   │   └── session.py       # In-memory data store
+│   ├── core/
+│   │   ├── data_loader.py   # CSV/Excel loading
+│   │   ├── schema_analyzer.py # Relationship detection
+│   │   ├── quality_audit.py # Anomaly detection
+│   │   └── ai_enricher.py  # Payload builder
+│   └── data/                # Uploaded files storage
+├── frontend/                  # Next.js + Tailwind
 │   ├── app/
-│   │   ├── __init__.py
-│   │   └── data_pulse_app.py # Main application class
-│   ├── data_loader.py        # File loading utilities
-│   ├── schema_analyzer.py   # Relationship detection & ER diagrams
-│   ├── quality_audit.py     # Anomaly detection
-│   └── ai_enricher.py       # AI payload generation
-├── .streamlit/
-│   └── config.toml          # Streamlit configuration
+│   │   ├── page.tsx        # Upload page
+│   │   └── dashboard/      # Dashboard views
+│   ├── components/           # UI components
+│   └── lib/                # Utilities
 └── README.md
 ```
 

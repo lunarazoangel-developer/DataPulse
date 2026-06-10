@@ -1,0 +1,59 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg-primary: #0a0a0a;
+  --bg-secondary: #171717;
+  --bg-tertiary: #262626;
+}
+
+body {
+  background-color: var(--bg-primary);
+  color: #e5e5e5;
+}
+
+@layer components {
+  .btn-primary {
+    @apply bg-bg-tertiary text-text-primary border border-border px-4 py-2 rounded hover:bg-border transition-colors font-medium;
+  }
+
+  .btn-secondary {
+    @apply bg-bg-secondary text-text-secondary border border-border px-4 py-2 rounded hover:bg-bg-tertiary transition-colors;
+  }
+
+  .card {
+    @apply bg-bg-secondary border border-border rounded-lg p-4;
+  }
+
+  .input {
+    @apply bg-bg-tertiary border border-border text-text-primary px-3 py-2 rounded focus:border-text-muted focus:outline-none w-full;
+  }
+
+  .progress-bar {
+    @apply h-2 bg-bg-tertiary rounded-full overflow-hidden;
+  }
+
+  .progress-bar-fill {
+    @apply h-full bg-white transition-all duration-300;
+  }
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #171717;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #404040;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #525252;
+}
