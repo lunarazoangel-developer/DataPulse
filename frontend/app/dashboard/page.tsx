@@ -44,6 +44,7 @@ export default function Dashboard() {
   })
   const [loading, setLoading] = useState(false)
   const [detectionProgress, setDetectionProgress] = useState(0)
+  const [payloadSize, setPayloadSize] = useState<{ bytes: number; human: string } | null>(null)
 
   useEffect(() => {
     loadData()
@@ -71,7 +72,8 @@ export default function Dashboard() {
   const runAnomalyDetection = async () => {
     setLoading(true)
     setDetectionProgress(0)
-    
+    setPayloadSize(null)
+
     const progressInterval = setInterval(() => {
       setDetectionProgress(prev => {
         if (prev >= 90) {
@@ -86,6 +88,13 @@ export default function Dashboard() {
       const response = await axios.post(`${API_URL}/api/analyze/anomalies`, settings)
       setAnomalies(response.data)
       setDetectionProgress(100)
+
+      try {
+        const sizeRes = await axios.get(`${API_URL}/api/payload/size`)
+        setPayloadSize({ bytes: sizeRes.data.size_bytes, human: sizeRes.data.size_human })
+      } catch (sizeErr) {
+        setPayloadSize(null)
+      }
     } catch (err) {
       console.error('Error running anomaly detection:', err)
     } finally {
@@ -409,11 +418,25 @@ export default function Dashboard() {
                   <p className="text-text-secondary text-center py-4">No anomalies detected</p>
                 )}
 
-                <div className="mt-6 pt-4 border-t border-border">
+                <div className="mt-6 pt-4 border-t border-border flex items-center justify-between gap-3">
                   <button onClick={downloadPayload} className="btn-primary flex items-center gap-2">
                     <Download className="w-4 h-4" />
                     Download AI Payload
                   </button>
+                  {payloadSize && (
+                    <span
+                      className={
+                        payloadSize.bytes < 100_000
+                          ? "text-xs text-status-green"
+                          : payloadSize.bytes < 1_000_000
+                          ? "text-xs text-status-yellow"
+                          : "text-xs text-status-red"
+                      }
+                      title="Tamaño estimado del payload JSON"
+                    >
+                      Peso: {payloadSize.human}
+                    </span>
+                  )}
                 </div>
               </div>
             )}

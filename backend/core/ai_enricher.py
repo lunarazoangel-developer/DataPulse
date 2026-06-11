@@ -62,17 +62,10 @@ class AIPayloadBuilder:
         sensitive_columns: Dict[str, List[str]],
         relationships: List[Dict] = None,
         max_sample_rows: int = 10,
-        include_green: bool = True
+        include_green: bool = True,
+        summary_only: bool = False,
     ) -> Dict[str, Any]:
         schemas = self.sanitize_schema(data_dict, sensitive_columns)
-        samples = self.sanitize_samples(data_dict, sensitive_columns, max_sample_rows)
-
-        green_samples = self._generate_green_samples(
-            traffic_light_report.get('green', []),
-            data_dict,
-            sensitive_columns,
-            max_sample_rows
-        )
 
         total_columns = sum(schema['column_count'] for schema in schemas.values())
         total_redacted = sum(schema['redacted_count'] for schema in schemas.values())
@@ -91,16 +84,15 @@ class AIPayloadBuilder:
             'yellow_anomalies_count': yellow_count,
             'green_anomalies_count': green_count,
             'generated_at': datetime.utcnow().isoformat() + 'Z',
-            'security_note': 'Sensitive columns have been redacted from this payload'
+            'security_note': 'Sensitive columns have been redacted from this payload',
+            'payload_mode': 'summary' if summary_only else 'full',
         }
 
         sanitized_relationships = self._sanitize_relationships(relationships, sensitive_columns) if relationships else []
 
-        payload = {
+        payload: Dict[str, Any] = {
             'metadata': metadata,
             'schemas': schemas,
-            'samples': samples,
-            'green_samples': green_samples,
             'relationships': sanitized_relationships,
             'anomalies': {
                 'red': traffic_light_report.get('red', []),
@@ -108,6 +100,17 @@ class AIPayloadBuilder:
                 'green': traffic_light_report.get('green', [])
             }
         }
+
+        if not summary_only:
+            payload['samples'] = self.sanitize_samples(
+                data_dict, sensitive_columns, max_sample_rows
+            )
+            payload['green_samples'] = self._generate_green_samples(
+                traffic_light_report.get('green', []),
+                data_dict,
+                sensitive_columns,
+                max_sample_rows,
+            )
 
         return payload
 

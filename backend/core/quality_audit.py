@@ -3,6 +3,8 @@ import polars as pl
 import numpy as np
 from rapidfuzz import fuzz, process
 
+from .quality_audit_helpers import MAX_SAMPLES_PER_ANOMALY
+
 
 class TextAnomalyDetector:
     def __init__(self, similarity_threshold: float = 80.0, min_frequency: int = 5):
@@ -11,6 +13,9 @@ class TextAnomalyDetector:
 
     def set_threshold(self, threshold: float) -> None:
         self.similarity_threshold = threshold
+
+    def set_min_frequency(self, min_frequency: int) -> None:
+        self.min_frequency = max(1, int(min_frequency))
 
     def _classify_text_severity(self, similarity: float, issue_type: str) -> str:
         if issue_type == 'Missing Data':
@@ -65,7 +70,12 @@ class TextAnomalyDetector:
 
         return anomalies
 
-    def detect_fuzzy(self, series: pl.Series, max_unique: int = 500) -> List[Dict]:
+    def detect_fuzzy(
+        self,
+        series: pl.Series,
+        max_unique: int = 500,
+        length_tolerance: int = 2,
+    ) -> List[Dict]:
         clean_series = series.drop_nulls().cast(pl.Utf8)
         normalized_series = clean_series.str.to_lowercase().str.strip_chars()
 
@@ -77,76 +87,95 @@ class TextAnomalyDetector:
         if len(unique_normalized) > max_unique:
             return []
 
-        anomalies = []
-        processed = set()
+        anomalies: List[Dict] = []
+        processed: set = set()
 
-        normalized_to_originals = {}
+        normalized_to_originals: Dict[str, List[str]] = {}
         for orig_val, norm_val in zip(clean_series.to_list(), normalized_series.to_list()):
-            if norm_val not in normalized_to_originals:
-                normalized_to_originals[norm_val] = []
+            normalized_to_originals.setdefault(norm_val, [])
             if orig_val not in normalized_to_originals[norm_val]:
                 normalized_to_originals[norm_val].append(orig_val)
 
         unique_list = unique_normalized.to_list()
-        
-        for norm_value in unique_list:
-            if norm_value in processed:
+
+        def _build_blocks(values: List[str]) -> Dict[str, List[str]]:
+            blocks: Dict[str, List[str]] = {}
+            for v in values:
+                key = (len(v) // max(1, length_tolerance), v[:1].lower())
+                blocks.setdefault(key, []).append(v)
+            return blocks
+
+        blocks = _build_blocks(unique_list)
+
+        for block_key, block_values in blocks.items():
+            if len(block_values) < 2:
                 continue
 
-            choices = [v for v in unique_list if v != norm_value and v not in processed]
-            if not choices:
-                continue
+            for norm_value in block_values:
+                if norm_value in processed:
+                    continue
 
-            results = process.extract(
-                norm_value,
-                choices,
-                scorer=fuzz.ratio,
-                limit=10
-            )
+                choices = [v for v in block_values if v != norm_value and v not in processed]
+                if not choices:
+                    continue
 
-            similar_values = []
-            for match, score, _ in results:
-                if score >= self.similarity_threshold:
-                    similar_values.append({
-                        'normalized_value': match,
-                        'similarity': score
-                    })
+                results = process.extract(
+                    norm_value,
+                    choices,
+                    scorer=fuzz.ratio,
+                    limit=10,
+                    score_cutoff=self.similarity_threshold,
+                )
 
-            if similar_values:
-                min_similarity = min(sv['similarity'] for sv in similar_values)
-                severity = self._classify_text_severity(min_similarity, 'Fuzzy Match')
+                similar_values = [
+                    {"normalized_value": match, "similarity": score}
+                    for match, score, _ in results
+                ]
+
+                if not similar_values:
+                    continue
+
+                min_similarity = min(sv["similarity"] for sv in similar_values)
+                severity = self._classify_text_severity(min_similarity, "Fuzzy Match")
 
                 original_values = normalized_to_originals.get(norm_value, [norm_value])
 
                 for orig_val in original_values:
-                    similar_to_values = []
+                    similar_to_values: List[str] = []
                     for sv in similar_values:
-                        matched_originals = normalized_to_originals.get(sv['normalized_value'], [sv['normalized_value']])
-                        similar_to_values.extend(matched_originals)
-
-                    anomalies.append({
-                        'value': norm_value,
-                        'original_value': ', '.join(original_values),
-                        'similar_to': ', '.join(similar_to_values),
-                        'similarity': 100.0,
-                        'issue_type': 'Fuzzy Match',
-                        'severity': severity
-                    })
+                        similar_to_values.extend(
+                            normalized_to_originals.get(
+                                sv["normalized_value"], [sv["normalized_value"]]
+                            )
+                        )
+                    anomalies.append(
+                        {
+                            "value": norm_value,
+                            "original_value": ", ".join(original_values),
+                            "similar_to": ", ".join(similar_to_values),
+                            "similarity": 100.0,
+                            "issue_type": "Fuzzy Match",
+                            "severity": severity,
+                        }
+                    )
 
                 for sv in similar_values:
-                    matched_originals = normalized_to_originals.get(sv['normalized_value'], [sv['normalized_value']])
-                    severity = self._classify_text_severity(sv['similarity'], 'Fuzzy Match')
-
+                    matched_originals = normalized_to_originals.get(
+                        sv["normalized_value"], [sv["normalized_value"]]
+                    )
+                    severity = self._classify_text_severity(sv["similarity"], "Fuzzy Match")
                     for matched_orig in matched_originals:
-                        anomalies.append({
-                            'value': sv['normalized_value'],
-                            'original_value': matched_orig,
-                            'similar_to': norm_value,
-                            'similarity': sv['similarity'],
-                            'issue_type': 'Fuzzy Match',
-                            'severity': severity
-                        })
-                        processed.add(sv['normalized_value'])
+                        anomalies.append(
+                            {
+                                "value": sv["normalized_value"],
+                                "original_value": matched_orig,
+                                "similar_to": norm_value,
+                                "similarity": sv["similarity"],
+                                "issue_type": "Fuzzy Match",
+                                "severity": severity,
+                            }
+                        )
+                        processed.add(sv["normalized_value"])
 
                 processed.add(norm_value)
 
@@ -154,50 +183,54 @@ class TextAnomalyDetector:
 
     def detect_low_frequency(self, series: pl.Series) -> List[Dict]:
         clean_series = series.drop_nulls().cast(pl.Utf8)
-        value_counts = clean_series.value_counts()
-
-        anomalies = []
+        value_counts_df = clean_series.value_counts()
 
         col_name = series.name if series.name else 'value'
-        for row in value_counts.to_dicts():
+        low_freq_rows: List[Dict] = []
+        for row in value_counts_df.to_dicts():
             value = row.get(col_name, row.get('value', ''))
             count = row.get('counts', 0)
             if count < self.min_frequency:
-                anomalies.append({
-                    'value': str(value),
-                    'count': count,
-                    'issue_type': 'Low Frequency',
-                    'severity': 'green'
-                })
+                low_freq_rows.append({'value': str(value), 'count': count})
 
-        return anomalies
+        if not low_freq_rows:
+            return []
+
+        return [
+            {
+                'column': col_name,
+                'total_count': len(low_freq_rows),
+                'min_frequency': self.min_frequency,
+                'examples': low_freq_rows[:MAX_SAMPLES_PER_ANOMALY],
+                'issue_type': 'Low Frequency',
+                'severity': 'green',
+            }
+        ]
 
     def detect_case_inconsistency_enhanced(self, series: pl.Series) -> List[Dict]:
         clean_series = series.drop_nulls().cast(pl.Utf8)
         normalized_series = clean_series.str.to_lowercase().str.strip_chars()
 
-        normalized_to_originals = {}
+        normalized_to_originals: Dict[str, set] = {}
 
         for orig_val, norm_val in zip(clean_series.to_list(), normalized_series.to_list()):
-            if norm_val not in normalized_to_originals:
-                normalized_to_originals[norm_val] = set()
-            normalized_to_originals[norm_val].add(orig_val)
+            normalized_to_originals.setdefault(norm_val, set()).add(orig_val)
 
-        anomalies = []
+        anomalies: List[Dict] = []
+        col_name = series.name if series.name else 'value'
 
         for norm_key, original_variants in normalized_to_originals.items():
             if len(original_variants) > 1:
                 sorted_variants = sorted(original_variants)
-
-                for variant in sorted_variants:
-                    anomalies.append({
-                        'normalized_value': norm_key,
-                        'original_value': variant,
-                        'variants': ', '.join(sorted_variants),
-                        'variant_count': len(original_variants),
-                        'issue_type': 'Inconsistent Capitalization',
-                        'severity': 'red'
-                    })
+                anomalies.append({
+                    'column': col_name,
+                    'normalized_value': norm_key,
+                    'variants': sorted_variants,
+                    'variant_count': len(original_variants),
+                    'examples': sorted_variants[:MAX_SAMPLES_PER_ANOMALY],
+                    'issue_type': 'Inconsistent Capitalization',
+                    'severity': 'red'
+                })
 
         return anomalies
 
