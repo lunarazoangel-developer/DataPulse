@@ -6,6 +6,8 @@
   --bg-primary: #0a0a0a;
   --bg-secondary: #171717;
   --bg-tertiary: #262626;
+  --pulse: #3b82f6;
+  --pulse-glow: rgba(59, 130, 246, 0.55);
 }
 
 body {
@@ -22,6 +24,18 @@ body {
     @apply bg-bg-secondary text-text-secondary border border-border px-4 py-2 rounded hover:bg-bg-tertiary transition-colors;
   }
 
+  .btn-pulse {
+    @apply relative bg-pulse text-white border border-pulse px-5 py-2.5 rounded font-semibold flex items-center gap-2 transition-all;
+    box-shadow: 0 0 0 0 var(--pulse-glow);
+  }
+  .btn-pulse:hover:not(:disabled) {
+    box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.18), 0 0 24px rgba(59, 130, 246, 0.45);
+    filter: brightness(1.05);
+  }
+  .btn-pulse:disabled {
+    @apply opacity-50 cursor-not-allowed;
+  }
+
   .card {
     @apply bg-bg-secondary border border-border rounded-lg p-4;
   }
@@ -36,6 +50,25 @@ body {
 
   .progress-bar-fill {
     @apply h-full bg-white transition-all duration-300;
+  }
+}
+
+@keyframes pulse-dash {
+  0%   { stroke-dashoffset: 240; }
+  100% { stroke-dashoffset: -240; }
+}
+
+@keyframes spark {
+  0%, 100% { opacity: 0; }
+  4%       { opacity: 1; }
+  96%      { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
   }
 }
 

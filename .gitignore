@@ -29,6 +29,17 @@ Thumbs.db
 # Backend
 backend/data/
 
+# Environment files (NEVER commit secrets)
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+!backend/.env.example
+frontend/.env.local
+frontend/.env*.local
+!frontend/.env.example
+
 # Frontend
 frontend/.next/
 frontend/node_modules/

@@ -1,21 +1,25 @@
 # DataPulse
 
-Intelligent data cleaning and anomaly detection application with AI-ready payload generation.
+Intelligent data cleaning and anomaly detection application with AI-ready payload generation and an optional AI chat for discrepancy triage.
 
 ## Architecture
 
 - **Frontend**: Next.js (React) + Tailwind CSS
 - **Backend**: FastAPI (Python) + Polars
+- **AI (beta)**: DeepSeek via OpenAI-compatible HTTP API
 
 ## Features
 
 - **File Upload**: Support for CSV and Excel files (including multi-sheet Excel)
+- **Persistent Database Storage**: Every upload becomes a timestamped folder under `backend/data/` (`YYYY-MM-DD_HH-MM-SS/`). All saved databases can be reopened, deleted, or listed from the home screen.
 - **Database Relationships**: Mermaid.js ER diagrams to visualize table relationships
 - **Anomaly Detection**: Traffic light system (RED/YELLOW/GREEN) for text and numeric data
 - **Advanced Discrepancy Detection**: Format validation, duplicates, type mismatches, date anomalies, cardinality, domain rules
 - **Column Profiling**: Auto-generated metrics (completeness, uniqueness, null %, type, recommendations) per column
 - **Column Security**: Auto-detect and mark sensitive columns (PII, passwords, etc.)
 - **AI Payload Generation**: Export sanitized JSON payloads for AI processing (with size estimate)
+- **AI Analysis Tab (beta)**: Inline chat inside the dashboard that unlocks after a detection run. Sends the AI-ready report to DeepSeek and asks it to enumerate discrepancies to fix. Falls back to a 503 banner if the key is missing.
+- **Branded UI**: Animated pulse-logo (ECG-style), pulse markers inside the RED/YELLOW/GREEN counters, custom-styled file picker, and a `btn-pulse` primary action button.
 - **Sampling & Performance**: Optional row sampling for very large datasets, vectorized detection for fast execution
 - **Detection Timing**: Per-detector timing breakdown for performance observability
 
@@ -29,6 +33,8 @@ python -m venv venv
 # Windows: venv\Scripts\activate
 # Linux/Mac: source venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env
+# Edit .env and set DEEPSEEK_API_KEY if you want the AI chat to work.
 ```
 
 ### Frontend
@@ -36,6 +42,7 @@ pip install -r requirements.txt
 ```bash
 cd frontend
 npm install
+# .env.local is optional; NEXT_PUBLIC_API_URL defaults to http://localhost:8000
 ```
 
 ## Usage
@@ -47,7 +54,7 @@ cd backend
 uvicorn main:app --reload --port 8000
 ```
 
-The API will be available at `http://localhost:8000`
+The API will be available at `http://localhost:8000`.
 
 ### Running the Frontend
 
@@ -56,24 +63,53 @@ cd frontend
 npm run dev
 ```
 
-The application will open in your browser at `http://localhost:3000`
+The application will open in your browser at `http://localhost:3000`.
 
 ## How to Use
 
-1. **Upload Data**: Use the upload form to upload CSV or Excel files
-2. **Explore Relationships**: View database relationships in the Dashboard tab
-3. **Configure Security**: Mark sensitive columns in the Anomaly Report tab
-4. **Adjust Detection**: Use sliders to tune anomaly detection sensitivity
-5. **Review Anomalies**: See traffic light results (RED/YELLOW/GREEN)
-6. **Export**: Download AI-ready JSON payload (size estimate shown next to the button)
+1. **Open a saved database or create a new one**: The home page lists every database saved under `backend/data/`. Click **Open** to reopen one, or upload files to create a brand-new database with a timestamp name.
+2. **Explore Relationships**: View database relationships in the Database Relationships tab.
+3. **Configure & Run Detection**: Open the Anomaly Report tab, adjust settings, and click **Run Detection**.
+4. **Review Anomalies**: See traffic light results (RED/YELLOW/GREEN) with per-column counters that include a pulse marker in the severity color.
+5. **AI Analysis (optional)**: Once at least one anomaly is found, a new **AI Analysis** tab unlocks next to the others. Click it to open the inline chat; the report is sent automatically to DeepSeek for triage.
+6. **Export**: Download AI-ready JSON payload (size estimate shown next to the button).
+
+### Storage Layout
+
+```
+backend/data/
+└── 2026-06-11_14-30-45/        ← one folder per upload session
+    ├── meta.json               ← { name, created_at, tables, file_count, total_rows }
+    ├── users.csv
+    └── products.xlsx
+```
+
+Clearing the in-memory session (`Clear` button) does NOT delete the folder on disk, so previously saved databases remain available to reopen.
+
+## AI Chat Configuration (beta)
+
+The AI tab requires a DeepSeek API key. Get one at <https://platform.deepseek.com/>, then edit `backend/.env`:
+
+```bash
+DEEPSEEK_API_KEY=sk-your-key-here
+DEEPSEEK_MODEL=deepseek-chat
+DEEPSEEK_API_URL=https://api.deepseek.com/v1/chat/completions
+DEEPSEEK_TIMEOUT=60
+```
+
+Restart `uvicorn` after editing. The chat tab will then show a green "Ready" badge; if the key is missing it shows "Beta" and disables the input. The backend never exposes the key to the frontend.
 
 ## API Endpoints
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/api/files/upload` | Upload data files |
-| GET | `/api/files/tables` | Get list of loaded tables |
-| DELETE | `/api/files/clear` | Clear all data |
+| POST | `/api/files/upload` | Upload files and create a new timestamped database |
+| GET | `/api/files/tables` | Get tables in the current session (includes `database` name) |
+| DELETE | `/api/files/clear` | Clear in-memory session (keeps saved databases on disk) |
+| GET | `/api/databases` | List all saved databases under `backend/data/` |
+| GET | `/api/databases/current` | Name of the currently active database |
+| GET | `/api/databases/{name}` | Load a saved database into the session |
+| DELETE | `/api/databases/{name}` | Permanently delete a saved database folder |
 | GET | `/api/analyze/relationships` | Get table relationships |
 | GET | `/api/analyze/schema` | Get schema analysis |
 | POST | `/api/analyze/anomalies` | Run anomaly detection (returns categorized anomalies + column profiles + timings) |
@@ -82,34 +118,46 @@ The application will open in your browser at `http://localhost:3000`
 | GET | `/api/payload/size` | Estimate AI payload size in bytes/human format |
 | GET | `/api/payload/preview` | Preview AI payload (summary mode, max 5 examples per anomaly) |
 | GET | `/api/payload/download` | Download AI payload JSON (summary mode) |
+| GET | `/api/ai/status` | `{ available: bool, model: str }` for the AI chat |
+| POST | `/api/ai/chat` | Send a message to the AI; body `{ payload, history, message? }`. Returns 503 if the key is missing. |
 
 ## Project Structure
 
 ```
 datapulse/
-├── backend/                    # FastAPI + Polars
-│   ├── main.py               # Entry point
-│   ├── requirements.txt      # Python dependencies
+├── backend/                         # FastAPI + Polars
+│   ├── main.py                      # Entry point
+│   ├── config.py                    # .env loader (DeepSeek, etc.)
+│   ├── requirements.txt             # Python dependencies
+│   ├── .env.example                 # Template for local secrets
 │   ├── api/
-│   │   ├── routes/
-│   │   │   ├── files.py     # File upload endpoints
-│   │   │   ├── analyze.py   # Analysis endpoints
-│   │   │   └── payload.py   # Payload generation + size
-│   │   └── session.py       # In-memory data store
+│   │   ├── session.py               # In-memory data store
+│   │   └── routes/
+│   │       ├── files.py             # Upload / tables / clear
+│   │       ├── databases.py         # List / open / delete saved DBs
+│   │       ├── analyze.py           # Relationships / schema / anomalies
+│   │       ├── payload.py           # AI payload builder + size estimate
+│   │       └── ai.py                # DeepSeek chat proxy (beta)
+│   ├── ai/
+│   │   └── chat.py                  # DeepSeek client + prompt builder
 │   ├── core/
 │   │   ├── data_loader.py           # CSV/Excel loading
+│   │   ├── database_manager.py      # Timestamped-folder CRUD
 │   │   ├── schema_analyzer.py       # Relationship detection
 │   │   ├── quality_audit.py         # Text/numeric anomaly detection
 │   │   ├── quality_audit_helpers.py # Format/regex/date/domain rules
 │   │   ├── discrepancy_profiler.py  # 9 discrepancy detectors + column profiler
 │   │   └── ai_enricher.py           # AI payload builder (summary/full mode)
-│   └── data/                # Uploaded files storage
-├── frontend/                  # Next.js + Tailwind
+│   └── data/                        # Saved databases (gitignored)
+├── frontend/                        # Next.js + Tailwind
 │   ├── app/
-│   │   ├── page.tsx        # Upload page
-│   │   └── dashboard/      # Dashboard views
-│   ├── components/           # UI components
-│   └── lib/                # Utilities
+│   │   ├── page.tsx                 # Upload + saved databases home
+│   │   └── dashboard/page.tsx       # 3 tabs: Relationships / Anomaly Report / AI Analysis
+│   ├── components/
+│   │   ├── PulseLogo.tsx            # Animated wordmark + ECG SVG
+│   │   ├── PulseBar.tsx             # Reusable ECG line (full / compact)
+│   │   └── MermaidDiagram.tsx
+│   └── lib/api.ts                   # Typed axios helpers
 └── README.md
 ```
 
@@ -203,10 +251,9 @@ The download endpoint produces an **AI-ready JSON summary**:
 
 ## Security
 
-Sensitive columns (detected or manually marked) are:
-- Excluded from AI payload schemas
-- Redacted as `"[REDACTED]"` in sample data
-- Not sent to AI for processing
+- Sensitive columns (detected or manually marked) are excluded from AI payload schemas and redacted as `"[REDACTED]"` in sample data.
+- The DeepSeek API key is read from `backend/.env` on the server and never sent to the browser.
+- All `.env` and `.env.local` files are gitignored; only `.env.example` is tracked.
 
 ## License
 

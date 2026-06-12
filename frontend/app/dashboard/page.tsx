@@ -1,11 +1,34 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import axios from 'axios'
 import Link from 'next/link'
-import { ArrowLeft, Database, AlertTriangle, Settings, Download, Table2, BarChart3 } from 'lucide-react'
-import { API_URL } from '@/lib/api'
+import {
+  ArrowLeft,
+  Database,
+  AlertTriangle,
+  Settings,
+  Download,
+  Table2,
+  BarChart3,
+  FolderOpen,
+  Sparkles,
+  Send,
+  AlertCircle,
+  User as UserIcon,
+  Trash2,
+} from 'lucide-react'
+import {
+  API_URL,
+  api,
+  aiApi,
+  AIPayload,
+  AIStatus,
+  ChatMessage,
+} from '@/lib/api'
 import MermaidDiagram from '@/components/MermaidDiagram'
+import PulseLogo from '@/components/PulseLogo'
+import PulseBar from '@/components/PulseBar'
 
 interface Relationship {
   source: string
@@ -30,7 +53,12 @@ interface NullStats {
 }
 
 export default function Dashboard() {
-  const [activeTab, setActiveTab] = useState('relationships')
+  const [activeTab, setActiveTab] = useState<'relationships' | 'anomalies' | 'ai'>('relationships')
+  const SECTION_TITLES: Record<'relationships' | 'anomalies' | 'ai', string> = {
+    relationships: 'Database Relationships',
+    anomalies: 'Anomaly Report',
+    ai: 'AI Analysis',
+  }
   const [tables, setTables] = useState<TableInfo[]>([])
   const [relationships, setRelationships] = useState<Relationship[]>([])
   const [mermaidDiagram, setMermaidDiagram] = useState('')
@@ -45,15 +73,36 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(false)
   const [detectionProgress, setDetectionProgress] = useState(0)
   const [payloadSize, setPayloadSize] = useState<{ bytes: number; human: string } | null>(null)
+  const [currentDatabase, setCurrentDatabase] = useState<string>('')
+
+  const [aiStatus, setAiStatus] = useState<AIStatus | null>(null)
+  const [aiPayload, setAiPayload] = useState<AIPayload | null>(null)
+  const [aiPayloadLoading, setAiPayloadLoading] = useState(false)
+  const [aiPayloadError, setAiPayloadError] = useState<string>('')
+  const [aiMessages, setAiMessages] = useState<ChatMessage[]>([])
+  const [aiInput, setAiInput] = useState('')
+  const [aiSending, setAiSending] = useState(false)
+  const [aiError, setAiError] = useState<string>('')
+  const [aiSeedFired, setAiSeedFired] = useState(false)
+  const aiScrollRef = useRef<HTMLDivElement | null>(null)
+  const aiTextareaRef = useRef<HTMLTextAreaElement | null>(null)
 
   useEffect(() => {
     loadData()
+    aiApi
+      .getStatus()
+      .then(res => setAiStatus(res.data))
+      .catch(err => {
+        console.error('Failed to fetch AI status:', err)
+        setAiStatus({ available: false, model: 'unknown' })
+      })
   }, [])
 
   const loadData = async () => {
     try {
       const tablesRes = await axios.get(`${API_URL}/api/files/tables`)
       setTables(tablesRes.data.tables || [])
+      setCurrentDatabase(tablesRes.data.database || '')
 
       const relRes = await axios.get(`${API_URL}/api/analyze/relationships`)
       setRelationships(relRes.data.relationships || [])
@@ -132,15 +181,119 @@ export default function Dashboard() {
 
   const getAnomalySummary = () => {
     if (!anomalies?.categorized) return { red: 0, yellow: 0, green: 0 }
-    
+
     const red = anomalies.categorized.red?.reduce((acc: number, item: any) => acc + (item.data?.length || 0), 0) || 0
     const yellow = anomalies.categorized.yellow?.reduce((acc: number, item: any) => acc + (item.data?.length || 0), 0) || 0
     const green = anomalies.categorized.green?.reduce((acc: number, item: any) => acc + (item.data?.length || 0), 0) || 0
-    
+
     return { red, yellow, green }
   }
 
   const summary = getAnomalySummary()
+  const isAiUnlocked = !!anomalies && (summary.red + summary.yellow + summary.green) > 0
+
+  const SEED_QUESTION =
+    'Analiza este reporte de calidad de datos y dime qué discrepancias debo corregir, ordenadas por prioridad.'
+
+  const loadAiPayload = async () => {
+    setAiPayloadLoading(true)
+    setAiPayloadError('')
+    try {
+      const res = await api.getPayloadPreview()
+      setAiPayload(res.data.payload)
+    } catch (err: any) {
+      const detail =
+        err?.response?.data?.detail ||
+        err?.message ||
+        'No se pudo cargar el reporte. Corre la detección de anomalías primero.'
+      setAiPayloadError(detail)
+      setAiPayload(null)
+    } finally {
+      setAiPayloadLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    if (activeTab === 'ai' && isAiUnlocked && !aiPayload && !aiPayloadLoading) {
+      void loadAiPayload()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, isAiUnlocked])
+
+  useEffect(() => {
+    if (aiScrollRef.current) {
+      aiScrollRef.current.scrollTop = aiScrollRef.current.scrollHeight
+    }
+  }, [aiMessages, aiSending])
+
+  const sendAiMessage = async (text: string) => {
+    const trimmed = text.trim()
+    if (!trimmed || !aiPayload || aiSending) return
+
+    const userMsg: ChatMessage = { role: 'user', content: trimmed }
+    const nextHistory = [...aiMessages, userMsg]
+    setAiMessages(nextHistory)
+    setAiInput('')
+    setAiError('')
+    setAiSending(true)
+
+    try {
+      const res = await aiApi.chat({
+        payload: aiPayload,
+        history: nextHistory.slice(0, -1),
+        message: trimmed,
+      })
+      const reply = res.data.message
+      setAiMessages(prev => [...prev, { role: 'assistant', content: reply }])
+    } catch (err: any) {
+      const detail =
+        err?.response?.data?.detail ||
+        err?.message ||
+        'Error contacting the AI service.'
+      setAiError(detail)
+      setAiMessages(prev => [
+        ...prev,
+        { role: 'assistant', content: `⚠️ ${detail}` },
+      ])
+    } finally {
+      setAiSending(false)
+      aiTextareaRef.current?.focus()
+    }
+  }
+
+  useEffect(() => {
+    if (activeTab !== 'ai') return
+    if (!aiPayload || !aiStatus || aiSeedFired) return
+    if (!aiStatus.available) {
+      setAiMessages([
+        {
+          role: 'assistant',
+          content:
+            'AI service is not configured yet. Add a DeepSeek API key in `backend/.env` (variable `DEEPSEEK_API_KEY`) and restart the backend to enable analysis.',
+        },
+      ])
+      setAiSeedFired(true)
+      return
+    }
+    setAiSeedFired(true)
+    void sendAiMessage(SEED_QUESTION)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, aiPayload, aiStatus, aiSeedFired])
+
+  const handleAiKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      void sendAiMessage(aiInput)
+    }
+  }
+
+  const handleClearAiChat = () => {
+    setAiMessages([])
+    setAiError('')
+    setAiSeedFired(false)
+  }
+
+  const aiEnabled = aiStatus?.available ?? false
 
   return (
     <main className="min-h-screen bg-bg-primary p-8">
@@ -150,10 +303,19 @@ export default function Dashboard() {
             <ArrowLeft className="w-4 h-4" />
             Back
           </Link>
-          <h1 className="text-3xl font-bold text-accent">Dashboard</h1>
+          <PulseLogo size="sm" showWordmark={false} />
+          <h1 className="text-3xl font-bold text-accent">
+            {SECTION_TITLES[activeTab] ?? 'Dashboard'}
+          </h1>
+          {currentDatabase && (
+            <div className="flex items-center gap-2 text-sm text-text-secondary bg-bg-secondary border border-border px-3 py-1.5 rounded font-mono">
+              <FolderOpen className="w-4 h-4 text-accent" />
+              {currentDatabase}
+            </div>
+          )}
         </div>
 
-        <div className="flex gap-2 mb-6">
+        <div className="flex gap-2 mb-6 flex-wrap">
           <button
             onClick={() => setActiveTab('relationships')}
             className={`px-4 py-2 rounded flex items-center gap-2 ${activeTab === 'relationships' ? 'bg-white text-black font-medium' : 'btn-secondary'}`}
@@ -168,6 +330,26 @@ export default function Dashboard() {
             <AlertTriangle className="w-4 h-4" />
             Anomaly Report
           </button>
+          {isAiUnlocked && (
+            <button
+              onClick={() => setActiveTab('ai')}
+              className={`px-4 py-2 rounded flex items-center gap-2 ${
+                activeTab === 'ai' ? 'bg-white text-black font-medium' : 'btn-secondary'
+              }`}
+            >
+              <Sparkles className={`w-4 h-4 ${activeTab === 'ai' ? '' : 'animate-pulse text-pulse'}`} />
+              AI Analysis
+              <span
+                className={`text-[9px] uppercase tracking-widest font-semibold px-1.5 py-0.5 rounded border ${
+                  aiEnabled
+                    ? 'text-status-green border-status-green/40 bg-status-green/10'
+                    : 'text-status-yellow border-status-yellow/40 bg-status-yellow/10'
+                }`}
+              >
+                {aiEnabled ? 'Ready' : 'Beta'}
+              </span>
+            </button>
+          )}
         </div>
 
         {activeTab === 'relationships' && (
@@ -349,17 +531,38 @@ export default function Dashboard() {
               <div className="card">
                 <h3 className="font-semibold mb-4">Detection Summary</h3>
                 <div className="grid grid-cols-3 gap-4 mb-6">
-                  <div className="p-4 bg-status-red/10 border border-status-red/30 rounded text-center">
-                    <div className="text-2xl font-bold text-status-red">{summary.red}</div>
-                    <div className="text-sm text-text-secondary">RED</div>
+                  <div className="p-4 bg-status-red/10 border border-status-red/30 rounded">
+                    <div className="flex items-center justify-center gap-2">
+                      <PulseBar color="red" compact />
+                      <div className="text-2xl font-bold text-status-red">
+                        {summary.red}
+                      </div>
+                    </div>
+                    <div className="text-sm text-text-secondary text-center mt-1">
+                      RED
+                    </div>
                   </div>
-                  <div className="p-4 bg-status-yellow/10 border border-status-yellow/30 rounded text-center">
-                    <div className="text-2xl font-bold text-status-yellow">{summary.yellow}</div>
-                    <div className="text-sm text-text-secondary">YELLOW</div>
+                  <div className="p-4 bg-status-yellow/10 border border-status-yellow/30 rounded">
+                    <div className="flex items-center justify-center gap-2">
+                      <PulseBar color="yellow" compact />
+                      <div className="text-2xl font-bold text-status-yellow">
+                        {summary.yellow}
+                      </div>
+                    </div>
+                    <div className="text-sm text-text-secondary text-center mt-1">
+                      YELLOW
+                    </div>
                   </div>
-                  <div className="p-4 bg-status-green/10 border border-status-green/30 rounded text-center">
-                    <div className="text-2xl font-bold text-status-green">{summary.green}</div>
-                    <div className="text-sm text-text-secondary">GREEN</div>
+                  <div className="p-4 bg-status-green/10 border border-status-green/30 rounded">
+                    <div className="flex items-center justify-center gap-2">
+                      <PulseBar color="green" compact />
+                      <div className="text-2xl font-bold text-status-green">
+                        {summary.green}
+                      </div>
+                    </div>
+                    <div className="text-sm text-text-secondary text-center mt-1">
+                      GREEN
+                    </div>
                   </div>
                 </div>
 
@@ -418,7 +621,7 @@ export default function Dashboard() {
                   <p className="text-text-secondary text-center py-4">No anomalies detected</p>
                 )}
 
-                <div className="mt-6 pt-4 border-t border-border flex items-center justify-between gap-3">
+                <div className="mt-6 pt-4 border-t border-border flex flex-wrap items-center justify-between gap-3">
                   <button onClick={downloadPayload} className="btn-primary flex items-center gap-2">
                     <Download className="w-4 h-4" />
                     Download AI Payload
@@ -440,6 +643,154 @@ export default function Dashboard() {
                 </div>
               </div>
             )}
+          </div>
+        )}
+
+        {activeTab === 'ai' && isAiUnlocked && (
+          <div className="space-y-4">
+            {!aiEnabled && (
+              <div className="card border-status-yellow/40 bg-status-yellow/10 flex items-start gap-3">
+                <AlertCircle className="w-5 h-5 text-status-yellow flex-shrink-0 mt-0.5" />
+                <div className="text-sm">
+                  <p className="font-semibold text-status-yellow mb-1">
+                    AI is not configured
+                  </p>
+                  <p className="text-text-secondary">
+                    Set <code className="font-mono text-xs">DEEPSEEK_API_KEY</code> in{' '}
+                    <code className="font-mono text-xs">backend/.env</code> and restart the
+                    backend to enable the AI chat. You can still see the report loaded below.
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {aiPayloadError && !aiPayload && (
+              <div className="card border-status-red/40 bg-status-red/10 text-status-red text-sm">
+                {aiPayloadError}
+              </div>
+            )}
+
+            {aiPayloadLoading && !aiPayload && (
+              <div className="card text-text-secondary text-sm text-center py-10">
+                <span className="inline-block w-2 h-2 bg-pulse rounded-full animate-pulse mr-2" />
+                Loading report payload…
+              </div>
+            )}
+
+            {aiPayload && (
+              <>
+                <div
+                  ref={aiScrollRef}
+                  className="card overflow-y-auto space-y-4 min-h-[400px] max-h-[60vh]"
+                >
+                  {aiMessages.length === 0 && !aiSending && (
+                    <p className="text-text-muted text-sm text-center py-8">
+                      Starting analysis…
+                    </p>
+                  )}
+
+                  {aiMessages.map((m, idx) => (
+                    <div
+                      key={idx}
+                      className={`flex gap-3 ${
+                        m.role === 'user' ? 'justify-end' : 'justify-start'
+                      }`}
+                    >
+                      {m.role !== 'user' && (
+                        <div className="flex-shrink-0 w-8 h-8 rounded-full bg-pulse/10 border border-pulse/40 flex items-center justify-center">
+                          <PulseBar color="blue" compact />
+                        </div>
+                      )}
+
+                      <div
+                        className={`max-w-[80%] rounded-lg px-4 py-2.5 text-sm whitespace-pre-wrap break-words ${
+                          m.role === 'user'
+                            ? 'bg-pulse text-white'
+                            : 'bg-bg-tertiary border border-border text-text-primary'
+                        }`}
+                      >
+                        {m.content}
+                      </div>
+
+                      {m.role === 'user' && (
+                        <div className="flex-shrink-0 w-8 h-8 rounded-full bg-bg-tertiary border border-border flex items-center justify-center">
+                          <UserIcon className="w-4 h-4 text-text-secondary" />
+                        </div>
+                      )}
+                    </div>
+                  ))}
+
+                  {aiSending && (
+                    <div className="flex gap-3 justify-start">
+                      <div className="flex-shrink-0 w-8 h-8 rounded-full bg-pulse/10 border border-pulse/40 flex items-center justify-center">
+                        <PulseBar color="blue" compact />
+                      </div>
+                      <div className="bg-bg-tertiary border border-border rounded-lg px-4 py-3 text-sm text-text-secondary flex items-center gap-2">
+                        <span className="inline-block w-2 h-2 bg-pulse rounded-full animate-pulse" />
+                        <span
+                          className="inline-block w-2 h-2 bg-pulse rounded-full animate-pulse"
+                          style={{ animationDelay: '120ms' }}
+                        />
+                        <span
+                          className="inline-block w-2 h-2 bg-pulse rounded-full animate-pulse"
+                          style={{ animationDelay: '240ms' }}
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  {aiError && aiMessages[aiMessages.length - 1]?.role !== 'assistant' && (
+                    <div className="bg-status-red/10 border border-status-red/30 text-status-red text-sm rounded-lg px-3 py-2">
+                      {aiError}
+                    </div>
+                  )}
+                </div>
+
+                <div className="flex items-end gap-3">
+                  <button
+                    onClick={handleClearAiChat}
+                    disabled={aiMessages.length === 0 || aiSending}
+                    className="btn-secondary flex items-center gap-2 self-end"
+                    title="Clear conversation"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                  <textarea
+                    ref={aiTextareaRef}
+                    value={aiInput}
+                    onChange={e => setAiInput(e.target.value)}
+                    onKeyDown={handleAiKeyDown}
+                    placeholder={
+                      aiEnabled
+                        ? 'Ask a follow-up about the discrepancies… (Enter to send, Shift+Enter for newline)'
+                        : 'AI not configured — input disabled'
+                    }
+                    disabled={!aiEnabled || aiSending}
+                    rows={2}
+                    className="input resize-none flex-1"
+                  />
+                  <button
+                    onClick={() => void sendAiMessage(aiInput)}
+                    disabled={!aiEnabled || aiSending || aiInput.trim().length === 0}
+                    className="btn-pulse self-end"
+                  >
+                    <Send className="w-4 h-4" />
+                    Send
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
+        {activeTab === 'ai' && !isAiUnlocked && (
+          <div className="card text-center py-10">
+            <Sparkles className="w-10 h-10 text-pulse mx-auto mb-4" />
+            <h2 className="text-xl font-semibold mb-2">AI Analysis locked</h2>
+            <p className="text-text-secondary text-sm">
+              Run anomaly detection first. Once at least one discrepancy is found, the
+              AI Analysis tab unlocks here.
+            </p>
           </div>
         )}
       </div>

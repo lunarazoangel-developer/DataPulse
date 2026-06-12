@@ -30,6 +30,11 @@ module.exports = {
           red: '#ef4444',
           yellow: '#eab308',
           green: '#22c55e',
+        },
+        pulse: {
+          DEFAULT: '#3b82f6',
+          glow: 'rgba(59, 130, 246, 0.55)',
+          track: 'rgba(59, 130, 246, 0.22)',
         }
       },
     },

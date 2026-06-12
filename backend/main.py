@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
-from api.routes import files, analyze, payload
+from api.routes import files, analyze, payload, databases, ai
 
 app = FastAPI(title="DataPulse API", description="Backend API for DataPulse data cleaning application")
 
@@ -20,8 +20,10 @@ async def add_cors_headers(request, call_next):
     return response
 
 app.include_router(files.router, prefix="/api/files", tags=["files"])
+app.include_router(databases.router, prefix="/api/databases", tags=["databases"])
 app.include_router(analyze.router, prefix="/api/analyze", tags=["analyze"])
 app.include_router(payload.router, prefix="/api/payload", tags=["payload"])
+app.include_router(ai.router, prefix="/api/ai", tags=["ai"])
 
 @app.get("/")
 def root():
