@@ -18,7 +18,7 @@ Intelligent data cleaning and anomaly detection application with AI-ready payloa
 - **Column Profiling**: Auto-generated metrics (completeness, uniqueness, null %, type, recommendations) per column
 - **Column Security**: Auto-detect and mark sensitive columns (PII, passwords, etc.)
 - **AI Payload Generation**: Export sanitized JSON payloads for AI processing (with size estimate)
-- **AI Analysis Tab (beta)**: Inline chat inside the dashboard that unlocks after a detection run. Sends the AI-ready report to DeepSeek and asks it to enumerate discrepancies to fix. Falls back to a 503 banner if the key is missing.
+- **AI Analysis Tab (beta)**: Inline chat inside the dashboard that unlocks after a detection run. Sends the AI-ready report to DeepSeek and returns a structured **plan → approve → apply** flow with color-coded proposal cards and atomic CSV writes.
 - **Branded UI**: Animated pulse-logo (ECG-style), pulse markers inside the RED/YELLOW/GREEN counters, custom-styled file picker, and a `btn-pulse` primary action button.
 - **Sampling & Performance**: Optional row sampling for very large datasets, vectorized detection for fast execution
 - **Detection Timing**: Per-detector timing breakdown for performance observability
@@ -71,7 +71,7 @@ The application will open in your browser at `http://localhost:3000`.
 2. **Explore Relationships**: View database relationships in the Database Relationships tab.
 3. **Configure & Run Detection**: Open the Anomaly Report tab, adjust settings, and click **Run Detection**.
 4. **Review Anomalies**: See traffic light results (RED/YELLOW/GREEN) with per-column counters that include a pulse marker in the severity color.
-5. **AI Analysis (optional)**: Once at least one anomaly is found, a new **AI Analysis** tab unlocks next to the others. Click it to open the inline chat; the report is sent automatically to DeepSeek for triage.
+5. **AI Analysis (optional)**: Once at least one anomaly is found, a new **AI Analysis** tab unlocks next to the others. Click it to open the inline chat. The report is sent automatically to DeepSeek, which returns a structured plan. Approve / reject each card, then click **Aplicar cambios aprobados** (or type `continuar` in the chat) to apply them to the underlying tables.
 6. **Export**: Download AI-ready JSON payload (size estimate shown next to the button).
 
 ### Storage Layout
@@ -92,12 +92,44 @@ The AI tab requires a DeepSeek API key. Get one at <https://platform.deepseek.co
 
 ```bash
 DEEPSEEK_API_KEY=sk-your-key-here
-DEEPSEEK_MODEL=deepseek-chat
+DEEPSEEK_MODEL=deepseek-v4-flash
 DEEPSEEK_API_URL=https://api.deepseek.com/v1/chat/completions
 DEEPSEEK_TIMEOUT=60
 ```
 
+> The model name is case-sensitive — DeepSeek only accepts the exact lowercase
+> ids `deepseek-v4-flash` (faster, cheaper — recommended default) or
+> `deepseek-v4-pro` (higher quality). Older aliases like `deepseek-chat` may
+> still work on some accounts but are not the current recommended names.
+
 Restart `uvicorn` after editing. The chat tab will then show a green "Ready" badge; if the key is missing it shows "Beta" and disables the input. The backend never exposes the key to the frontend.
+
+## Plan → Approve → Apply Workflow (beta)
+
+When the AI Analysis tab opens, the JSON report is sent to DeepSeek. The model is instructed to respond with a **structured plan** (a `summary` plus an array of `proposals`) rather than free-form text. The plan is rendered inside the chat as a stack of **color-coded cards**, one per proposal, ordered from highest to lowest risk.
+
+Each card shows the proposed change, the affected `table.column`, the action, and a collapsible `params` block. The user can toggle two buttons per card:
+
+- **✓ Aprobar** (default — green)
+- **✕ Rechazar** (red)
+
+Once at least one card is in the approved state, a sticky action panel appears with the button **Aplicar cambios aprobados (N)**. Typing `continuar` in the chat input also triggers the apply step. Approved changes are dispatched to `POST /api/ai/apply`, which mutates the in-memory Polars DataFrames, writes the new CSV files atomically (`.tmp` + `os.replace`) and refreshes `meta.json`. The response includes a per-proposal report of `rows_changed` and any errors. After a successful apply a banner offers **Re-detectar anomalías** (the user decides when to re-run the detectors — the workflow does not auto-re-run).
+
+### Supported actions
+
+| Action | Default risk | Description |
+| --- | --- | --- |
+| `strip_whitespace` | low | Trim leading/trailing whitespace |
+| `normalize_case` | low | `lower` / `upper` / `title` |
+| `fill_null` | low | Fill nulls and placeholders (`N/A`, `--`, `s/d`…) with a value |
+| `replace_regex` | medium | `str.replace_all(pattern, replacement)` |
+| `standardize_date` | medium | Try each `input_formats` entry and emit `target_format` |
+| `clip_values` | medium | Clip numeric column to `[lower, upper]` |
+| `cast_type` | high | Cast to `Int64`, `Float64`, `String`, `Boolean`, `Date`, `Datetime`, … |
+| `drop_duplicates` | high | `df.unique(subset=…)` (subset optional) |
+| `drop_rows` | high | `df.filter(~mask)` with `is_null`, `not_null`, `equals`, `not_equals`, `matches`, `between` |
+
+Actions that would alter Excel files (`.xlsx`, `.xls`) are blocked at the apply step and reported as errors — re-upload the file as CSV to enable those changes.
 
 ## API Endpoints
 
@@ -119,7 +151,8 @@ Restart `uvicorn` after editing. The chat tab will then show a green "Ready" bad
 | GET | `/api/payload/preview` | Preview AI payload (summary mode, max 5 examples per anomaly) |
 | GET | `/api/payload/download` | Download AI payload JSON (summary mode) |
 | GET | `/api/ai/status` | `{ available: bool, model: str }` for the AI chat |
-| POST | `/api/ai/chat` | Send a message to the AI; body `{ payload, history, message? }`. Returns 503 if the key is missing. |
+| POST | `/api/ai/chat` | Send a message to the AI; body `{ payload, history, message? }`. Returns `{ message, summary, proposals }` so the UI can render the structured plan. Returns 503 if the key is missing. |
+| POST | `/api/ai/apply` | Apply approved proposals. Body `{ database?, proposals: Proposal[] }`. Returns `{ database, applied[], skipped[], errors[], table_summaries[] }`. |
 
 ## Project Structure
 
@@ -137,11 +170,13 @@ datapulse/
 │   │       ├── databases.py         # List / open / delete saved DBs
 │   │       ├── analyze.py           # Relationships / schema / anomalies
 │   │       ├── payload.py           # AI payload builder + size estimate
-│   │       └── ai.py                # DeepSeek chat proxy (beta)
+│   │       └── ai.py                # DeepSeek chat proxy + /ai/apply (beta)
 │   ├── ai/
-│   │   └── chat.py                  # DeepSeek client + prompt builder
+│   │   ├── chat.py                  # DeepSeek client + structured prompt parser
+│   │   └── actions.py               # Supported proposal actions + risk hints
 │   ├── core/
 │   │   ├── data_loader.py           # CSV/Excel loading
+│   │   ├── data_transformer.py      # apply_proposal dispatcher (Polars)
 │   │   ├── database_manager.py      # Timestamped-folder CRUD
 │   │   ├── schema_analyzer.py       # Relationship detection
 │   │   ├── quality_audit.py         # Text/numeric anomaly detection
@@ -156,8 +191,11 @@ datapulse/
 │   ├── components/
 │   │   ├── PulseLogo.tsx            # Animated wordmark + ECG SVG
 │   │   ├── PulseBar.tsx             # Reusable ECG line (full / compact)
-│   │   └── MermaidDiagram.tsx
-│   └── lib/api.ts                   # Typed axios helpers
+│   │   ├── MermaidDiagram.tsx
+│   │   └── ProposalCard.tsx         # AI plan card (approve / reject)
+│   └── lib/
+│       ├── api.ts                   # Typed axios helpers
+│       └── proposals.ts             # Risk meta + helpers (sort, isContinuar…)
 └── README.md
 ```
 

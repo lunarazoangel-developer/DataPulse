@@ -17,6 +17,8 @@ import {
   AlertCircle,
   User as UserIcon,
   Trash2,
+  Play,
+  RefreshCw,
 } from 'lucide-react'
 import {
   API_URL,
@@ -24,11 +26,20 @@ import {
   aiApi,
   AIPayload,
   AIStatus,
+  ApplyResponseBody,
   ChatMessage,
+  Proposal,
 } from '@/lib/api'
+import {
+  countApproved,
+  defaultApprovals,
+  isContinuar,
+  sortByRisk,
+} from '@/lib/proposals'
 import MermaidDiagram from '@/components/MermaidDiagram'
 import PulseLogo from '@/components/PulseLogo'
 import PulseBar from '@/components/PulseBar'
+import ProposalCard from '@/components/ProposalCard'
 
 interface Relationship {
   source: string
@@ -84,6 +95,11 @@ export default function Dashboard() {
   const [aiSending, setAiSending] = useState(false)
   const [aiError, setAiError] = useState<string>('')
   const [aiSeedFired, setAiSeedFired] = useState(false)
+  const [pendingProposals, setPendingProposals] = useState<Proposal[]>([])
+  const [proposalApprovals, setProposalApprovals] = useState<Record<string, boolean>>({})
+  const [applying, setApplying] = useState(false)
+  const [lastApplyReport, setLastApplyReport] = useState<ApplyResponseBody | null>(null)
+  const [showReDetectBanner, setShowReDetectBanner] = useState(false)
   const aiScrollRef = useRef<HTMLDivElement | null>(null)
   const aiTextareaRef = useRef<HTMLTextAreaElement | null>(null)
 
@@ -230,6 +246,11 @@ export default function Dashboard() {
     const trimmed = text.trim()
     if (!trimmed || !aiPayload || aiSending) return
 
+    if (isContinuar(trimmed) && pendingProposals.length > 0) {
+      await applyApprovedChanges()
+      return
+    }
+
     const userMsg: ChatMessage = { role: 'user', content: trimmed }
     const nextHistory = [...aiMessages, userMsg]
     setAiMessages(nextHistory)
@@ -243,8 +264,23 @@ export default function Dashboard() {
         history: nextHistory.slice(0, -1),
         message: trimmed,
       })
-      const reply = res.data.message
-      setAiMessages(prev => [...prev, { role: 'assistant', content: reply }])
+      const { message, summary, proposals } = res.data
+      const display = summary?.trim()
+        ? summary
+        : proposals.length === 0
+        ? 'No tengo propuestas para este reporte.'
+        : message
+      setAiMessages(prev => [...prev, { role: 'assistant', content: display }])
+      if (Array.isArray(proposals) && proposals.length > 0) {
+        setPendingProposals(prev => {
+          const merged = [...prev, ...proposals]
+          return sortByRisk(merged)
+        })
+        setProposalApprovals(prev => ({
+          ...prev,
+          ...defaultApprovals(proposals),
+        }))
+      }
     } catch (err: any) {
       const detail =
         err?.response?.data?.detail ||
@@ -257,6 +293,65 @@ export default function Dashboard() {
       ])
     } finally {
       setAiSending(false)
+      aiTextareaRef.current?.focus()
+    }
+  }
+
+  const toggleProposal = (id: string, approved: boolean) => {
+    setProposalApprovals(prev => ({ ...prev, [id]: approved }))
+  }
+
+  const applyApprovedChanges = async () => {
+    if (applying || pendingProposals.length === 0) return
+    const approved = pendingProposals.filter(p => proposalApprovals[p.id] !== false)
+    if (approved.length === 0) {
+      setAiError('No hay propuestas aprobadas para aplicar.')
+      return
+    }
+
+    setApplying(true)
+    setAiError('')
+    try {
+      const res = await aiApi.apply({ proposals: approved })
+      setLastApplyReport(res.data)
+      setPendingProposals([])
+      setProposalApprovals({})
+      setShowReDetectBanner(true)
+
+      const lines: string[] = []
+      lines.push(
+        `✅ Cambios aplicados: ${res.data.applied.length} de ${approved.length} propuesta(s).`
+      )
+      if (res.data.errors.length > 0) {
+        lines.push('')
+        lines.push('⚠️ Errores:')
+        for (const e of res.data.errors) {
+          lines.push(`- ${e.table ?? e.id ?? '(?)'}: ${e.reason}`)
+        }
+      }
+      if (res.data.skipped.length > 0) {
+        lines.push('')
+        lines.push('Omitidas:')
+        for (const s of res.data.skipped) {
+          lines.push(`- ${s.id ?? '(?)'}: ${s.reason}`)
+        }
+      }
+      setAiMessages(prev => [
+        ...prev,
+        { role: 'assistant', content: lines.join('\n') },
+      ])
+    } catch (err: any) {
+      const detail =
+        err?.response?.data?.detail ||
+        err?.message ||
+        'Error applying the approved changes.'
+      setAiError(detail)
+      setAiMessages(prev => [
+        ...prev,
+        { role: 'assistant', content: `⚠️ ${detail}` },
+      ])
+    } finally {
+      setApplying(false)
       aiTextareaRef.current?.focus()
     }
   }
@@ -291,6 +386,10 @@ export default function Dashboard() {
     setAiMessages([])
     setAiError('')
     setAiSeedFired(false)
+    setPendingProposals([])
+    setProposalApprovals({})
+    setLastApplyReport(null)
+    setShowReDetectBanner(false)
   }
 
   const aiEnabled = aiStatus?.available ?? false
@@ -744,7 +843,78 @@ export default function Dashboard() {
                       {aiError}
                     </div>
                   )}
+
+                  {pendingProposals.length > 0 && (
+                    <div className="space-y-2 pt-2 border-t border-border">
+                      <div className="flex items-center justify-between text-xs text-text-secondary px-1">
+                        <span>
+                          Plan propuesto · {pendingProposals.length} cambio(s) ·{' '}
+                          <span className="text-status-green">
+                            {countApproved(pendingProposals, proposalApprovals)} aprobado(s)
+                          </span>
+                        </span>
+                      </div>
+                      {pendingProposals.map(p => (
+                        <ProposalCard
+                          key={p.id}
+                          proposal={p}
+                          approved={proposalApprovals[p.id] !== false}
+                          onToggle={toggleProposal}
+                        />
+                      ))}
+                    </div>
+                  )}
                 </div>
+
+                {pendingProposals.length > 0 && aiEnabled && (
+                  <div className="card border-pulse/40 bg-pulse/5 flex flex-wrap items-center gap-3">
+                    <Play className="w-4 h-4 text-pulse" />
+                    <p className="text-sm text-text-primary flex-1">
+                      {countApproved(pendingProposals, proposalApprovals)} cambio(s) aprobado(s) listo(s) para aplicarse
+                      a las tablas.
+                    </p>
+                    <button
+                      onClick={applyApprovedChanges}
+                      disabled={applying || countApproved(pendingProposals, proposalApprovals) === 0}
+                      className="btn-pulse disabled:opacity-50"
+                    >
+                      {applying
+                        ? 'Aplicando…'
+                        : `Aplicar cambios aprobados (${
+                            countApproved(pendingProposals, proposalApprovals)
+                          })`}
+                    </button>
+                  </div>
+                )}
+
+                {showReDetectBanner && lastApplyReport && (
+                  <div className="card border-status-green/40 bg-status-green/5 flex flex-wrap items-center gap-3">
+                    <RefreshCw className="w-4 h-4 text-status-green" />
+                    <p className="text-sm text-text-primary flex-1">
+                      {lastApplyReport.applied.length} cambio(s) aplicado(s) en{' '}
+                      <code className="font-mono text-xs">{lastApplyReport.database}</code>.
+                      Vuelve a correr la detección para ver el reporte actualizado.
+                    </p>
+                    <button
+                      onClick={() => {
+                        setActiveTab('anomalies')
+                        setShowReDetectBanner(false)
+                        void runAnomalyDetection()
+                      }}
+                      className="btn-secondary flex items-center gap-2"
+                    >
+                      <RefreshCw className="w-4 h-4" />
+                      Re-detectar anomalías
+                    </button>
+                    <button
+                      onClick={() => setShowReDetectBanner(false)}
+                      className="text-text-muted hover:text-text-primary text-xs"
+                      title="Cerrar"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                )}
 
                 <div className="flex items-end gap-3">
                   <button
@@ -762,7 +932,9 @@ export default function Dashboard() {
                     onKeyDown={handleAiKeyDown}
                     placeholder={
                       aiEnabled
-                        ? 'Ask a follow-up about the discrepancies… (Enter to send, Shift+Enter for newline)'
+                        ? pendingProposals.length > 0
+                          ? 'Escribe "continuar" para aplicar, o haz una pregunta de seguimiento…'
+                          : 'Ask a follow-up about the discrepancies… (Enter to send, Shift+Enter for newline)'
                         : 'AI not configured — input disabled'
                     }
                     disabled={!aiEnabled || aiSending}

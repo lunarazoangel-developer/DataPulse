@@ -52,6 +52,19 @@ export interface AIStatus {
   model: string
 }
 
+export type ProposalRisk = 'low' | 'medium' | 'high'
+
+export interface Proposal {
+  id: string
+  risk: ProposalRisk
+  title: string
+  description: string
+  table: string
+  column: string
+  action: string
+  params: Record<string, unknown>
+}
+
 export interface ChatRequestBody {
   payload: AIPayload
   history: ChatMessage[]
@@ -62,6 +75,31 @@ export interface ChatResponseBody {
   message: string
   available: boolean
   model: string
+  summary: string
+  proposals: Proposal[]
+}
+
+export interface ApplyRequestBody {
+  database?: string | null
+  proposals: Proposal[]
+}
+
+export interface ApplyResultItem {
+  id: string
+  table: string
+  column: string
+  action: string
+  risk: ProposalRisk
+  rows_changed: number
+  rows_after: number
+}
+
+export interface ApplyResponseBody {
+  database: string
+  applied: ApplyResultItem[]
+  skipped: { id?: string; reason: string }[]
+  errors: { id?: string; table?: string; column?: string; action?: string; reason: string }[]
+  table_summaries: { table: string; rows: number; columns: number }[]
 }
 
 export const api = {
@@ -88,4 +126,6 @@ export const aiApi = {
   getStatus: () => axios.get<AIStatus>(`${API_URL}/api/ai/status`),
   chat: (body: ChatRequestBody) =>
     axios.post<ChatResponseBody>(`${API_URL}/api/ai/chat`, body),
+  apply: (body: ApplyRequestBody) =>
+    axios.post<ApplyResponseBody>(`${API_URL}/api/ai/apply`, body),
 }
