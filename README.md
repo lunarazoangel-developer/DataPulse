@@ -95,6 +95,7 @@ DEEPSEEK_API_KEY=sk-your-key-here
 DEEPSEEK_MODEL=deepseek-v4-flash
 DEEPSEEK_API_URL=https://api.deepseek.com/v1/chat/completions
 DEEPSEEK_TIMEOUT=60
+DEEPSEEK_MAX_INPUT_TOKENS=32768
 ```
 
 > The model name is case-sensitive — DeepSeek only accepts the exact lowercase
@@ -103,6 +104,53 @@ DEEPSEEK_TIMEOUT=60
 > still work on some accounts but are not the current recommended names.
 
 Restart `uvicorn` after editing. The chat tab will then show a green "Ready" badge; if the key is missing it shows "Beta" and disables the input. The backend never exposes the key to the frontend.
+
+### AI instructions file (system prompt)
+
+The behaviour, tone, and rules of DataPulse AI live in `backend/ai/instructions.md`. The file is loaded once at startup and cached in memory; **edit it freely** and restart `uvicorn` to apply changes. The catalog of supported actions is injected automatically at the end of the file from `backend/ai/actions.py:render_action_catalog()` so you never have to keep the two in sync.
+
+Key sections of the file:
+
+- **Reglas duras** — non-negotiable rules (no redacted columns, no invented table/column names, JSON-only response).
+- **Cobertura de la tabla completa** — instructs the model to design proposals that cover the entire class of the problem, not just the 5 visible samples. The IA payload now includes `violation_count`, `affected_ratio`, and `top_patterns` so the model can reason about full-table scope.
+- **Fuera de alcance** — the model politely refuses anything that is not data-quality work.
+
+If the file is missing, the backend falls back to a hard-coded built-in prompt and logs a `WARNING`.
+
+### IA payload (compact, what the AI actually sees)
+
+`POST /api/ai/chat` now regenerates the payload server-side (`AIPayloadBuilder.build_ia_payload`) instead of trusting the client's payload. The IA payload is:
+
+- **Compact**: per-anomaly samples capped at 2 (the downloadable summary keeps 5).
+- **Enriched**: every anomaly carries `violation_count`, `affected_ratio`, `top_patterns` (top 5 values for the affected column), and `sample_vs_total_note` (e.g. `"2 of ~1,247 affected rows shown"`).
+- **Profiled**: every column in `schemas[*]` carries a `column_profiles` block (dtype, nulls, unique ratio, numeric stats / top values / date range).
+- **Stratified**: tables with >100,000 rows are sampled at 0.1% (preserving row count) so the IA never sees more than ~150 rows per huge table.
+- **Free of decoration**: the IA payload omits the `security_note` and `generated_at` fields, since they pad the token bill without informing the model.
+
+Inspect what the IA receives with `GET /api/payload/ia-context` and its size with `GET /api/payload/ia-size`.
+
+### Soft token cap
+
+The chat endpoint enforces a soft cap of `DEEPSEEK_MAX_INPUT_TOKENS` (default 32,768) estimated input tokens per call. When the cap is exceeded, the backend returns **HTTP 413** with:
+
+```json
+{
+  "detail": {
+    "code": "payload_too_large",
+    "estimated_tokens": 45230,
+    "threshold": 32768,
+    "suggestion": "Reduce sample_size, disable noisy detectors, sube DEEPSEEK_MAX_INPUT_TOKENS en backend/.env..."
+  }
+}
+```
+
+The frontend shows a red banner with the estimate and the suggestion. The user can also see the live estimate of the last successful call next to the chat input (`~2.3k tokens / cap 32768`).
+
+Successful calls return three useful response headers:
+
+- `X-Estimated-Tokens` — current payload size in estimated tokens.
+- `X-Token-Cap` — the cap that would have triggered HTTP 413.
+- `X-Payload-Mode` — always `ia` in the new flow (or `legacy` if `use_ia_payload=false`).
 
 ## Plan → Approve → Apply Workflow (beta)
 
@@ -122,14 +170,36 @@ Once at least one card is in the approved state, a sticky action panel appears w
 | `strip_whitespace` | low | Trim leading/trailing whitespace |
 | `normalize_case` | low | `lower` / `upper` / `title` |
 | `fill_null` | low | Fill nulls and placeholders (`N/A`, `--`, `s/d`…) with a value |
-| `replace_regex` | medium | `str.replace_all(pattern, replacement)` |
+| `replace_regex` | medium | `str.replace_all(pattern, replacement)` (designed for full-table scope) |
 | `standardize_date` | medium | Try each `input_formats` entry and emit `target_format` |
 | `clip_values` | medium | Clip numeric column to `[lower, upper]` |
+| `standardize_format` | medium | Reformat strings via strptime/strftime pair |
 | `cast_type` | high | Cast to `Int64`, `Float64`, `String`, `Boolean`, `Date`, `Datetime`, … |
 | `drop_duplicates` | high | `df.unique(subset=…)` (subset optional) |
-| `drop_rows` | high | `df.filter(~mask)` with `is_null`, `not_null`, `equals`, `not_equals`, `matches`, `between` |
+| `drop_rows` | high | `df.filter(~mask)` with `is_null`, `not_null`, `equals`, `not_equals`, `in`, `matches`, `between` |
 
 Actions that would alter Excel files (`.xlsx`, `.xls`) are blocked at the apply step and reported as errors — re-upload the file as CSV to enable those changes.
+
+### Coverage feedback in the UI
+
+Every approved proposal shows a coverage chip next to the risk badge — e.g. `Full table (~5,000 rows)` or `~12% (~600 rows)`. This comes from `core.data_transformer.preflight_affected_rows`, which counts how many rows the proposal will touch on the in-memory DataFrame **before** mutating it. Operators like `drop_rows` with `in: ["N/A", "--", "s/d"]` and `replace_regex` with a generic pattern return accurate estimates; `cast_type` and `drop_duplicates` return `null` because their scope depends on the data after the change.
+
+### Adaptive top patterns + post-apply re-detection
+
+The IA payload includes the **3 most common values** of each affected column. If the column has more than 30 unique values, the cap is bumped adaptively (up to 10) so the IA can derive a regex that covers the whole class. The bump is local to the affected anomaly and never exceeds the hard cap.
+
+After the apply step, the backend re-runs the discrepancy detectors on the modified tables and reports the **remaining anomalies** (same detection_type, still positive count) in the `remaining_anomalies` field of the `ApplyResponse`. The dashboard shows a yellow banner with up to 8 of them and a button **Pedir a la IA una propuesta más amplia (N/3)** that pre-fills the chat with a context-rich follow-up. The button is capped at 3 rounds per session to prevent infinite refinement loops.
+
+### Downloading tables after IA cleanup
+
+A new endpoint serves each table of the active database in **CSV** or **XLSX** (downloads reflect the latest on-disk state, which is updated atomically after each apply):
+
+```
+GET /api/databases/{name}/tables/{table_name}/download?format=csv
+GET /api/databases/{name}/tables/{table_name}/download?format=xlsx
+```
+
+For Excel-backed tables the `table_name` uses the `<filename>::<sheet>` convention. The dashboard shows a **Descargar tabla** dropdown next to the apply success banner — one click per table to grab either format. Response headers `X-Rows` and `X-Columns` give the size before download.
 
 ## API Endpoints
 
@@ -142,6 +212,7 @@ Actions that would alter Excel files (`.xlsx`, `.xls`) are blocked at the apply 
 | GET | `/api/databases/current` | Name of the currently active database |
 | GET | `/api/databases/{name}` | Load a saved database into the session |
 | DELETE | `/api/databases/{name}` | Permanently delete a saved database folder |
+| GET | `/api/databases/{name}/tables/{table}/download?format=csv\|xlsx` | Download a single table from a saved database |
 | GET | `/api/analyze/relationships` | Get table relationships |
 | GET | `/api/analyze/schema` | Get schema analysis |
 | POST | `/api/analyze/anomalies` | Run anomaly detection (returns categorized anomalies + column profiles + timings) |
@@ -150,6 +221,8 @@ Actions that would alter Excel files (`.xlsx`, `.xls`) are blocked at the apply 
 | GET | `/api/payload/size` | Estimate AI payload size in bytes/human format |
 | GET | `/api/payload/preview` | Preview AI payload (summary mode, max 5 examples per anomaly) |
 | GET | `/api/payload/download` | Download AI payload JSON (summary mode) |
+| GET | `/api/payload/ia-context` | Get the compact payload the IA actually sees (`payload_mode: ia`) |
+| GET | `/api/payload/ia-size` | Estimate size and tokens of the IA payload |
 | GET | `/api/ai/status` | `{ available: bool, model: str }` for the AI chat |
 | POST | `/api/ai/chat` | Send a message to the AI; body `{ payload, history, message? }`. Returns `{ message, summary, proposals }` so the UI can render the structured plan. Returns 503 if the key is missing. |
 | POST | `/api/ai/apply` | Apply approved proposals. Body `{ database?, proposals: Proposal[] }`. Returns `{ database, applied[], skipped[], errors[], table_summaries[] }`. |
@@ -173,7 +246,8 @@ datapulse/
 │   │       └── ai.py                # DeepSeek chat proxy + /ai/apply (beta)
 │   ├── ai/
 │   │   ├── chat.py                  # DeepSeek client + structured prompt parser
-│   │   └── actions.py               # Supported proposal actions + risk hints
+│   │   ├── actions.py               # Supported proposal actions + risk hints
+│   │   └── instructions.md          # External system prompt (edit & restart)
 │   ├── core/
 │   │   ├── data_loader.py           # CSV/Excel loading
 │   │   ├── data_transformer.py      # apply_proposal dispatcher (Polars)
@@ -192,7 +266,8 @@ datapulse/
 │   │   ├── PulseLogo.tsx            # Animated wordmark + ECG SVG
 │   │   ├── PulseBar.tsx             # Reusable ECG line (full / compact)
 │   │   ├── MermaidDiagram.tsx
-│   │   └── ProposalCard.tsx         # AI plan card (approve / reject)
+│   │   ├── ProposalCard.tsx         # AI plan card (approve / reject)
+│   │   └── TableDownloadMenu.tsx    # CSV/XLSX per-table download dropdown
 │   └── lib/
 │       ├── api.ts                   # Typed axios helpers
 │       └── proposals.ts             # Risk meta + helpers (sort, isContinuar…)
@@ -292,6 +367,15 @@ The download endpoint produces an **AI-ready JSON summary**:
 - Sensitive columns (detected or manually marked) are excluded from AI payload schemas and redacted as `"[REDACTED]"` in sample data.
 - The DeepSeek API key is read from `backend/.env` on the server and never sent to the browser.
 - All `.env` and `.env.local` files are gitignored; only `.env.example` is tracked.
+
+## Tests
+
+```bash
+cd backend
+python -m pytest tests/ -v
+```
+
+The suite covers the new architecture: the `instructions.md` loader and fallback (`test_instructions_file.py`), the soft token cap and history truncation (`test_token_cap.py`), and the full-table scope of `build_ia_payload` and the new actions (`test_ai_full_coverage.py`). 17 tests, no network required.
 
 ## License
 

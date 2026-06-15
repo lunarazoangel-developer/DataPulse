@@ -63,12 +63,15 @@ export interface Proposal {
   column: string
   action: string
   params: Record<string, unknown>
+  estimated_affected_rows?: number | null
+  coverage_note?: string | null
 }
 
 export interface ChatRequestBody {
   payload: AIPayload
   history: ChatMessage[]
   message?: string | null
+  use_ia_payload?: boolean
 }
 
 export interface ChatResponseBody {
@@ -92,6 +95,17 @@ export interface ApplyResultItem {
   risk: ProposalRisk
   rows_changed: number
   rows_after: number
+  estimated_affected_rows?: number | null
+  coverage_note?: string | null
+}
+
+export interface ApplyRemainingAnomaly {
+  table: string
+  column: string
+  detection_type: string
+  severity: 'red' | 'yellow' | 'green' | string
+  violation_count: number
+  note?: string
 }
 
 export interface ApplyResponseBody {
@@ -100,6 +114,7 @@ export interface ApplyResponseBody {
   skipped: { id?: string; reason: string }[]
   errors: { id?: string; table?: string; column?: string; action?: string; reason: string }[]
   table_summaries: { table: string; rows: number; columns: number }[]
+  remaining_anomalies?: ApplyRemainingAnomaly[]
 }
 
 export const api = {
@@ -128,4 +143,15 @@ export const aiApi = {
     axios.post<ChatResponseBody>(`${API_URL}/api/ai/chat`, body),
   apply: (body: ApplyRequestBody) =>
     axios.post<ApplyResponseBody>(`${API_URL}/api/ai/apply`, body),
+  getIAContext: () =>
+    axios.get<{ payload: AIPayload; payload_mode: string }>(
+      `${API_URL}/api/payload/ia-context`
+    ),
+  getIASize: () =>
+    axios.get<{
+      size_bytes: number
+      size_human: string
+      estimated_tokens: number
+      payload_mode: string
+    }>(`${API_URL}/api/payload/ia-size`),
 }

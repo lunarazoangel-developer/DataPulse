@@ -233,6 +233,10 @@ def _drop_rows(df: pl.DataFrame, table: str, params: Dict[str, Any]) -> Tuple[pl
         mask = df[column] == value
     elif operator == "not_equals":
         mask = df[column] != value
+    elif operator == "in":
+        if not isinstance(value, (list, tuple)) or not value:
+            raise TransformError("drop_rows: 'in' requires value=[v1, v2, ...] (non-empty list)")
+        mask = df[column].is_in(list(value))
     elif operator == "matches":
         pattern = re.compile(str(value))
         mask = df[column].cast(pl.Utf8).str.contains(pattern)
@@ -247,6 +251,44 @@ def _drop_rows(df: pl.DataFrame, table: str, params: Dict[str, Any]) -> Tuple[pl
     return df_new, before - df_new.height
 
 
+def _standardize_format(df: pl.DataFrame, table: str, params: Dict[str, Any]) -> Tuple[pl.DataFrame, int]:
+    """Reformat a string column using a strptime/strftime pair.
+
+    For every non-null value, try to parse it with ``input_format`` and write it
+    back with ``target_format``. Unparseable values are left as-is when
+    ``keep_unmatched`` is true; otherwise they become null.
+    """
+    column = params.get("_column", "")
+    input_format = params.get("input_format")
+    target_format = params.get("target_format")
+    keep_unmatched = bool(params.get("keep_unmatched", False))
+    if not input_format or not target_format:
+        raise TransformError(
+            "standardize_format requires 'input_format' and 'target_format'"
+        )
+    _validate_columns(df, table, column)
+
+    if df.height == 0:
+        return df, 0
+
+    if df[column].dtype != pl.Utf8:
+        df = df.with_columns(df[column].cast(pl.Utf8).alias(column))
+
+    before = [str(v) if v is not None else "" for v in df[column].to_list()]
+    parsed = df[column].str.strptime(pl.Datetime, input_format, strict=False)
+    if keep_unmatched:
+        reformatted = pl.when(parsed.is_not_null()).then(
+            parsed.dt.strftime(target_format)
+        ).otherwise(df[column])
+    else:
+        reformatted = parsed.dt.strftime(target_format)
+
+    df_new = df.with_columns(reformatted.alias(column))
+    after = [str(v) if v is not None else "" for v in df_new[column].to_list()]
+    changed = sum(1 for a, b in zip(before, after) if a != b)
+    return df_new, changed
+
+
 _DISPATCH = {
     "replace_regex": _replace_regex,
     "fill_null": _fill_null,
@@ -257,6 +299,7 @@ _DISPATCH = {
     "standardize_date": _standardize_date,
     "clip_values": _clip_values,
     "drop_rows": _drop_rows,
+    "standardize_format": _standardize_format,
 }
 
 
@@ -293,3 +336,143 @@ def atomic_write_csv(df: pl.DataFrame, path: str) -> None:
     tmp_path = f"{path}.tmp"
     df.write_csv(tmp_path)
     os.replace(tmp_path, path)
+
+
+def preflight_affected_rows(
+    df: pl.DataFrame,
+    proposal: Dict[str, Any],
+) -> Optional[int]:
+    """Best-effort estimate of how many rows the proposal will touch.
+
+    Returns ``None`` when the action's scope cannot be predicted without
+    actually mutating the frame (e.g. ``cast_type``, ``drop_duplicates``).
+    """
+    norm = coerce_proposal(proposal)
+    if not norm:
+        return None
+    action = norm["action"]
+    column = norm.get("column", "")
+    params = norm.get("params") or {}
+
+    try:
+        if action == "replace_regex":
+            if not column or column not in df.columns:
+                return None
+            pattern = params.get("pattern")
+            if not pattern:
+                return None
+            try:
+                re.compile(pattern)
+            except re.error:
+                return None
+            series = df[column].cast(pl.Utf8)
+            return int(series.str.contains(pattern).fill_null(False).sum())
+
+        if action == "drop_rows":
+            operator = params.get("operator", "is_null")
+            if operator in ("is_null", "not_null"):
+                if not column or column not in df.columns:
+                    return None
+                if operator == "is_null":
+                    return int(df[column].is_null().sum())
+                return int(df[column].is_not_null().sum())
+            if operator == "equals":
+                if not column or column not in df.columns:
+                    return None
+                return int((df[column] == params.get("value")).sum())
+            if operator == "not_equals":
+                if not column or column not in df.columns:
+                    return None
+                return int((df[column] != params.get("value")).sum())
+            if operator == "in":
+                if not column or column not in df.columns:
+                    return None
+                values = params.get("value")
+                if not isinstance(values, (list, tuple)) or not values:
+                    return None
+                return int(df[column].is_in(list(values)).sum())
+            if operator == "matches":
+                if not column or column not in df.columns:
+                    return None
+                pattern = params.get("value")
+                if not pattern:
+                    return None
+                try:
+                    compiled = re.compile(str(pattern))
+                except re.error:
+                    return None
+                return int(
+                    df[column].cast(pl.Utf8).str.contains(compiled).fill_null(False).sum()
+                )
+            if operator == "between":
+                if not column or column not in df.columns:
+                    return None
+                value = params.get("value")
+                if not isinstance(value, (list, tuple)) or len(value) != 2:
+                    return None
+                lo, hi = value
+                return int(((df[column] >= lo) & (df[column] <= hi)).sum())
+
+        if action == "strip_whitespace":
+            if not column or column not in df.columns or df[column].dtype != pl.Utf8:
+                return None
+            return int(
+                (df[column].fill_null("") != df[column].fill_null("").str.strip_chars()).sum()
+            )
+
+        if action == "normalize_case":
+            if not column or column not in df.columns or df[column].dtype != pl.Utf8:
+                return None
+            case = params.get("case", "lower")
+            if case == "lower":
+                normalized = df[column].str.to_lowercase()
+            elif case == "upper":
+                normalized = df[column].str.to_uppercase()
+            else:
+                normalized = df[column].str.to_titlecase()
+            return int((df[column].fill_null("") != normalized.fill_null("")).sum())
+
+        if action == "fill_null":
+            if not column or column not in df.columns:
+                return None
+            value = params.get("value", "")
+            also_placeholders = bool(params.get("also_fill_placeholders", True))
+            count = int(df[column].is_null().sum())
+            if also_placeholders and df[column].dtype == pl.Utf8:
+                lowered = df[column].str.to_lowercase()
+                count += int(lowered.is_in(list(_PLACEHOLDER_VALUES)).fill_null(False).sum())
+            return count
+
+        if action == "clip_values":
+            if not column or column not in df.columns:
+                return None
+            lower = params.get("lower")
+            upper = params.get("upper")
+            try:
+                series = df[column].cast(pl.Float64, strict=False)
+            except Exception:
+                return None
+            clipped = series
+            if lower is not None:
+                clipped = clipped.clip(min=lower)
+            if upper is not None:
+                clipped = clipped.clip(max=upper)
+            return int((series != clipped).fill_null(False).sum())
+    except Exception:
+        return None
+
+    return None
+
+
+def coverage_note(estimated: Optional[int], total: int) -> Optional[str]:
+    """Human-friendly note describing how much of the table is in scope."""
+    if estimated is None or total <= 0:
+        return None
+    pct = (estimated / total) * 100
+    if pct >= 99:
+        return f"Full table (~{estimated:,} rows)"
+    if pct >= 50:
+        return f"~{pct:.0f}% of table (~{estimated:,} rows)"
+    if pct >= 5:
+        return f"~{pct:.0f}% (~{estimated:,} rows)"
+    return f"~{estimated:,} rows only (partial scope)"

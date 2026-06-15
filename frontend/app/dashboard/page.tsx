@@ -40,6 +40,7 @@ import MermaidDiagram from '@/components/MermaidDiagram'
 import PulseLogo from '@/components/PulseLogo'
 import PulseBar from '@/components/PulseBar'
 import ProposalCard from '@/components/ProposalCard'
+import TableDownloadMenu from '@/components/TableDownloadMenu'
 
 interface Relationship {
   source: string
@@ -100,6 +101,10 @@ export default function Dashboard() {
   const [applying, setApplying] = useState(false)
   const [lastApplyReport, setLastApplyReport] = useState<ApplyResponseBody | null>(null)
   const [showReDetectBanner, setShowReDetectBanner] = useState(false)
+  const [aiRoundsUsed, setAiRoundsUsed] = useState(0)
+  const AI_REAPPLY_CAP = 3
+  const [aiTokenEstimate, setAiTokenEstimate] = useState<{ tokens: number; cap: number; payloadMode?: string } | null>(null)
+  const [aiPayloadTooLarge, setAiPayloadTooLarge] = useState<{ estimated: number; cap: number; suggestion: string } | null>(null)
   const aiScrollRef = useRef<HTMLDivElement | null>(null)
   const aiTextareaRef = useRef<HTMLTextAreaElement | null>(null)
 
@@ -263,7 +268,21 @@ export default function Dashboard() {
         payload: aiPayload,
         history: nextHistory.slice(0, -1),
         message: trimmed,
+        use_ia_payload: true,
       })
+      const tokensHeader = res.headers['x-estimated-tokens']
+      const capHeader = res.headers['x-token-cap']
+      const payloadMode = res.headers['x-payload-mode']
+      const tokens = tokensHeader ? parseInt(tokensHeader, 10) : NaN
+      const cap = capHeader ? parseInt(capHeader, 10) : NaN
+      if (!isNaN(tokens)) {
+        setAiTokenEstimate({
+          tokens,
+          cap: isNaN(cap) ? 0 : cap,
+          payloadMode,
+        })
+      }
+      setAiPayloadTooLarge(null)
       const { message, summary, proposals } = res.data
       const display = summary?.trim()
         ? summary
@@ -282,15 +301,33 @@ export default function Dashboard() {
         }))
       }
     } catch (err: any) {
-      const detail =
-        err?.response?.data?.detail ||
-        err?.message ||
-        'Error contacting the AI service.'
-      setAiError(detail)
-      setAiMessages(prev => [
-        ...prev,
-        { role: 'assistant', content: `⚠️ ${detail}` },
-      ])
+      if (err?.response?.status === 413) {
+        const detail = err?.response?.data?.detail || {}
+        setAiPayloadTooLarge({
+          estimated: detail.estimated_tokens ?? 0,
+          cap: detail.threshold ?? 0,
+          suggestion:
+            detail.suggestion ||
+            'Reduce sample_size, sube DEEPSEEK_MAX_INPUT_TOKENS o desactiva detectores ruidosos.',
+        })
+        setAiMessages(prev => [
+          ...prev,
+          {
+            role: 'assistant',
+            content: `⚠️ El reporte pesa ~${detail.estimated_tokens?.toLocaleString() ?? '?'} tokens y supera el cap de ${detail.threshold?.toLocaleString() ?? '?'}. Revisa el panel de tokens para más detalle.`,
+          },
+        ])
+      } else {
+        const detail =
+          err?.response?.data?.detail ||
+          err?.message ||
+          'Error contacting the AI service.'
+        setAiError(typeof detail === 'string' ? detail : JSON.stringify(detail))
+        setAiMessages(prev => [
+          ...prev,
+          { role: 'assistant', content: `⚠️ ${typeof detail === 'string' ? detail : JSON.stringify(detail)}` },
+        ])
+      }
     } finally {
       setAiSending(false)
       aiTextareaRef.current?.focus()
@@ -311,6 +348,7 @@ export default function Dashboard() {
 
     setApplying(true)
     setAiError('')
+    setAiRoundsUsed(prev => prev + 1)
     try {
       const res = await aiApi.apply({ proposals: approved })
       setLastApplyReport(res.data)
@@ -390,6 +428,7 @@ export default function Dashboard() {
     setProposalApprovals({})
     setLastApplyReport(null)
     setShowReDetectBanner(false)
+    setAiRoundsUsed(0)
   }
 
   const aiEnabled = aiStatus?.available ?? false
@@ -887,6 +926,62 @@ export default function Dashboard() {
                   </div>
                 )}
 
+                {showReDetectBanner && lastApplyReport && (lastApplyReport.remaining_anomalies?.length ?? 0) > 0 && (
+                  <div
+                    className="card border-status-yellow/40 bg-status-yellow/5 flex flex-col gap-2"
+                    data-testid="remaining-anomalies-banner"
+                  >
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <AlertCircle className="w-4 h-4 text-status-yellow" />
+                      <p className="text-sm text-status-yellow font-semibold flex-1">
+                        Quedan {lastApplyReport.remaining_anomalies!.length} anomalías del mismo tipo tras la limpieza
+                      </p>
+                    </div>
+                    <ul className="text-xs text-text-secondary list-disc pl-5 max-h-32 overflow-y-auto">
+                      {lastApplyReport.remaining_anomalies!.slice(0, 8).map((r, i) => (
+                        <li key={i}>
+                          <code className="font-mono">{r.table}.{r.column}</code>:{' '}
+                          {r.violation_count.toLocaleString()} filas con{' '}
+                          <span className="text-status-yellow">{r.detection_type}</span>
+                          {r.severity === 'red' && <span className="ml-1 text-status-red">(red)</span>}
+                        </li>
+                      ))}
+                      {lastApplyReport.remaining_anomalies!.length > 8 && (
+                        <li className="list-none text-text-muted italic">
+                          … y {lastApplyReport.remaining_anomalies!.length - 8} más
+                        </li>
+                      )}
+                    </ul>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => {
+                          if (aiRoundsUsed >= AI_REAPPLY_CAP) return
+                          const totalRemaining = lastApplyReport.remaining_anomalies!.reduce(
+                            (sum, r) => sum + r.violation_count,
+                            0,
+                          )
+                          const sample = lastApplyReport.remaining_anomalies![0]
+                          const msg = `Quedan ${totalRemaining.toLocaleString()} filas con ${lastApplyReport.remaining_anomalies!.length} tipos de anomalía todavía (ej: ${sample.detection_type} en ${sample.table}.${sample.column} con ${sample.violation_count} filas). Por favor propón acciones más amplias que cubran todas las filas afectadas, no solo valores literales. Ronda ${aiRoundsUsed}/${AI_REAPPLY_CAP}.`
+                          setActiveTab('ai')
+                          setAiInput(msg)
+                          setTimeout(() => aiTextareaRef.current?.focus(), 0)
+                        }}
+                        disabled={aiRoundsUsed >= AI_REAPPLY_CAP}
+                        className="btn-secondary flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                        data-testid="reapply-ia-button"
+                      >
+                        <Sparkles className="w-4 h-4" />
+                        Pedir a la IA una propuesta más amplia ({aiRoundsUsed}/{AI_REAPPLY_CAP})
+                      </button>
+                      {aiRoundsUsed >= AI_REAPPLY_CAP && (
+                        <span className="text-xs text-text-muted">
+                          Cap de re-aplicaciones alcanzado. Ajusta manualmente.
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                )}
+
                 {showReDetectBanner && lastApplyReport && (
                   <div className="card border-status-green/40 bg-status-green/5 flex flex-wrap items-center gap-3">
                     <RefreshCw className="w-4 h-4 text-status-green" />
@@ -895,6 +990,10 @@ export default function Dashboard() {
                       <code className="font-mono text-xs">{lastApplyReport.database}</code>.
                       Vuelve a correr la detección para ver el reporte actualizado.
                     </p>
+                    <TableDownloadMenu
+                      database={lastApplyReport.database}
+                      tables={lastApplyReport.table_summaries}
+                    />
                     <button
                       onClick={() => {
                         setActiveTab('anomalies')
@@ -913,6 +1012,31 @@ export default function Dashboard() {
                     >
                       ✕
                     </button>
+                  </div>
+                )}
+
+                {aiPayloadTooLarge && (
+                  <div
+                    className="card border-status-red/40 bg-status-red/5 flex flex-col gap-2"
+                    data-testid="ai-payload-too-large-banner"
+                  >
+                    <p className="text-sm text-status-red font-semibold flex items-center gap-2">
+                      <AlertCircle className="w-4 h-4" />
+                      Reporte demasiado grande para la IA
+                    </p>
+                    <p className="text-xs text-text-secondary">
+                      El payload pesa ~{aiPayloadTooLarge.estimated.toLocaleString()} tokens estimados
+                      y supera el cap de {aiPayloadTooLarge.cap.toLocaleString()}.
+                    </p>
+                    <p className="text-xs text-text-muted">{aiPayloadTooLarge.suggestion}</p>
+                    <div className="flex items-center gap-2">
+                      <button
+                        className="text-xs text-text-muted hover:text-text-primary"
+                        onClick={() => setAiPayloadTooLarge(null)}
+                      >
+                        Descartar
+                      </button>
+                    </div>
                   </div>
                 )}
 
@@ -950,6 +1074,15 @@ export default function Dashboard() {
                     Send
                   </button>
                 </div>
+                {aiTokenEstimate && (
+                  <p
+                    className="text-[11px] text-text-muted font-mono"
+                    data-testid="ai-token-estimate"
+                  >
+                    {aiTokenEstimate.payloadMode === 'ia' ? 'IA payload' : 'payload'} ~{aiTokenEstimate.tokens.toLocaleString()} tokens
+                    {aiTokenEstimate.cap > 0 && ` / cap ${aiTokenEstimate.cap.toLocaleString()}`}
+                  </p>
+                )}
               </>
             )}
           </div>

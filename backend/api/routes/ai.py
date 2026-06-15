@@ -1,7 +1,7 @@
 import os
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel, Field
 
 import config
@@ -11,12 +11,72 @@ from ai.actions import SUPPORTED_ACTIONS, coerce_proposal
 from ai.chat import (
     AIAvailabilityError,
     AIRuntimeError,
+    PayloadTooLargeError,
     call_deepseek,
+    estimate_payload_tokens,
     parse_plan,
 )
-from api.session import data_store, current_database
-from core.data_transformer import TransformError, apply_proposal, atomic_write_csv
+from api.session import data_store, current_database, sensitive_columns_store, relationships_store
+from core.ai_enricher import AIPayloadBuilder
+from core.data_transformer import (
+    TransformError,
+    apply_proposal,
+    atomic_write_csv,
+    coverage_note,
+    preflight_affected_rows,
+)
 from core.database_manager import DatabaseManager
+from core.quality_audit import NumericAnomalyDetector, TextAnomalyDetector
+from core.discrepancy_profiler import DiscrepancyDetector
+from .analyze import categorize_by_severity
+
+
+def _build_traffic_light_report(data: Dict) -> Dict:
+    text_detector = TextAnomalyDetector(similarity_threshold=80.0, min_frequency=5)
+    numeric_detector = NumericAnomalyDetector(iqr_multiplier=1.5, zscore_threshold=3.0)
+    discrepancy_detector = DiscrepancyDetector()
+
+    all_results: Dict = {}
+    for table_name, df in data.items():
+        text_results = text_detector.detect_all_columns(df)
+        numeric_results = numeric_detector.detect_all_columns(df, method="both")
+        discrepancy_results = discrepancy_detector.detect_all_columns(df)
+        table_level_results = discrepancy_detector.detect_table_level(df)
+
+        text_serializable: Dict = {}
+        for col, results in text_results.items():
+            text_serializable[col] = {}
+            for key, value in results.items():
+                if isinstance(value, list):
+                    text_serializable[col][key] = value
+
+        numeric_serializable: Dict = {}
+        for col, results in numeric_results.items():
+            numeric_serializable[col] = results
+
+        discrepancy_serializable: Dict = {}
+        for col, anomalies in discrepancy_results.items():
+            discrepancy_serializable[col] = anomalies
+
+        if (
+            text_serializable
+            or numeric_serializable
+            or discrepancy_serializable
+            or table_level_results
+        ):
+            all_results[table_name] = {
+                "text": text_serializable,
+                "numeric": numeric_serializable,
+                "discrepancies": discrepancy_serializable,
+                "table_level": table_level_results,
+            }
+
+    categorized = categorize_by_severity(all_results)
+    return {
+        "red": categorized.get("red", []),
+        "yellow": categorized.get("yellow", []),
+        "green": categorized.get("green", []),
+    }
 
 
 router = APIRouter()
@@ -32,6 +92,14 @@ class ChatRequest(BaseModel):
     payload: Dict[str, Any] = Field(default_factory=dict)
     history: List[ChatMessage] = Field(default_factory=list)
     message: Optional[str] = None
+    use_ia_payload: bool = Field(
+        default=True,
+        description=(
+            "When true (default), the backend regenerates the compact IA payload "
+            "from the current in-memory tables. When false, the caller-provided "
+            "`payload` is sent as-is (legacy behaviour)."
+        ),
+    )
 
 
 class ChatResponse(BaseModel):
@@ -55,6 +123,8 @@ class ApplyResultItem(BaseModel):
     risk: str
     rows_changed: int
     rows_after: int
+    estimated_affected_rows: Optional[int] = None
+    coverage_note: Optional[str] = None
 
 
 class ApplyResponse(BaseModel):
@@ -63,6 +133,7 @@ class ApplyResponse(BaseModel):
     skipped: List[Dict[str, Any]] = Field(default_factory=list)
     errors: List[Dict[str, Any]] = Field(default_factory=list)
     table_summaries: List[Dict[str, Any]] = Field(default_factory=list)
+    remaining_anomalies: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 @router.get("/status")
@@ -74,7 +145,7 @@ async def ai_status() -> Dict[str, Any]:
 
 
 @router.post("/chat", response_model=ChatResponse)
-async def ai_chat(request: ChatRequest) -> ChatResponse:
+async def ai_chat(request: ChatRequest, response: Response) -> ChatResponse:
     if not config.is_ai_enabled():
         raise HTTPException(
             status_code=503,
@@ -83,11 +154,50 @@ async def ai_chat(request: ChatRequest) -> ChatResponse:
 
     history = [{"role": m.role, "content": m.content} for m in request.history]
 
+    payload_to_send: Dict[str, Any]
+    if request.use_ia_payload:
+        session_id = "default"
+        data = data_store.get(session_id, {})
+        if not data:
+            raise HTTPException(status_code=404, detail="No data loaded")
+        sensitive = sensitive_columns_store.get(session_id, {})
+        rels = relationships_store.get(session_id, [])
+        traffic_light = _build_traffic_light_report(data)
+        builder = AIPayloadBuilder()
+        payload_to_send = builder.build_ia_payload(
+            data_dict=data,
+            traffic_light_report=traffic_light,
+            sensitive_columns=sensitive,
+            relationships=rels,
+        )
+    else:
+        payload_to_send = request.payload
+
+    estimated = estimate_payload_tokens(payload_to_send, history, request.message)
+    response.headers["X-Estimated-Tokens"] = str(estimated)
+    response.headers["X-Token-Cap"] = str(config.get_max_input_tokens())
+    response.headers["X-Payload-Mode"] = "ia" if request.use_ia_payload else "legacy"
+
     try:
         raw_reply = await call_deepseek(
-            payload=request.payload,
+            payload=payload_to_send,
             history=history,
             user_message=request.message,
+        )
+    except PayloadTooLargeError as exc:
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "code": "payload_too_large",
+                "message": str(exc),
+                "estimated_tokens": exc.estimated_tokens,
+                "threshold": exc.threshold,
+                "suggestion": (
+                    "Reduce sample_size, disable noisy detectors, "
+                    "sube DEEPSEEK_MAX_INPUT_TOKENS en backend/.env "
+                    "o envia el reporte igual (no recomendado)."
+                ),
+            },
         )
     except AIAvailabilityError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
@@ -166,6 +276,86 @@ def _file_path_for_table(db_name: str, table_name: str, file_map: Dict[str, str]
     return file_map.get(table_name)
 
 
+def _concern_key(proposal: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+    """Derive a (table, column) concern from a proposal so we can re-detect on it."""
+    table = proposal.get("table")
+    column = proposal.get("column")
+    if not table or not column:
+        return None
+    return (table, column)
+
+
+def _post_apply_scan(
+    dirty_tables: Dict[str, pl.DataFrame],
+    proposals: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Re-run discrepancy detectors on the modified tables.
+
+    Returns one entry per (table, column, detection_type) that still has a
+    positive ``violation_count`` after the apply step. The
+    ``proposals`` argument is the normalized list (already coerced by
+    ``coerce_proposal``), so we can read the table and the column
+    directly.
+
+    We do not filter by the proposal's ``action`` because actions like
+    ``replace_regex`` are not the same namespace as ``detection_type``
+    values like ``Format Violation`` or ``Type Mismatch``; the user and
+    the IA both need to know "any remaining issue in the columns I just
+    touched", not "a specific subtype".
+    """
+    if not dirty_tables or not proposals:
+        return []
+
+    concerns: List[Tuple[str, str]] = []
+    seen = set()
+    for norm in proposals:
+        key = _concern_key(norm)
+        if not key:
+            continue
+        table, column = key
+        if table not in dirty_tables:
+            continue
+        if (table, column) in seen:
+            continue
+        seen.add((table, column))
+        concerns.append((table, column))
+
+    if not concerns:
+        return []
+
+    from core.discrepancy_profiler import DiscrepancyDetector
+
+    disc_det = DiscrepancyDetector()
+    by_table: Dict[str, List[str]] = {}
+    for table, column in concerns:
+        by_table.setdefault(table, []).append(column)
+
+    remaining: List[Dict[str, Any]] = []
+    for tname, columns in by_table.items():
+        df = dirty_tables[tname]
+        if df.is_empty():
+            continue
+        try:
+            fresh = disc_det.detect_all_columns(df)
+        except Exception:
+            continue
+        for column in columns:
+            anomalies = fresh.get(column) or []
+            for anom in anomalies:
+                vc = int(anom.get("violation_count", 0) or 0)
+                if vc <= 0:
+                    continue
+                remaining.append({
+                    "table": tname,
+                    "column": column,
+                    "detection_type": anom.get("issue_type", "unknown"),
+                    "severity": anom.get("severity", "yellow"),
+                    "violation_count": vc,
+                    "note": "Still present after apply",
+                })
+    return remaining
+
+
 @router.post("/apply", response_model=ApplyResponse)
 async def ai_apply(request: ApplyRequest) -> ApplyResponse:
     if not request.proposals:
@@ -180,6 +370,7 @@ async def ai_apply(request: ApplyRequest) -> ApplyResponse:
     errors: List[Dict[str, Any]] = []
 
     dirty_tables: Dict[str, pl.DataFrame] = {}
+    normalized_for_scan: List[Dict[str, Any]] = []
 
     for raw in request.proposals:
         norm = coerce_proposal(raw)
@@ -203,6 +394,7 @@ async def ai_apply(request: ApplyRequest) -> ApplyResponse:
             continue
 
         df = dirty_tables.get(table_name, tables[table_name])
+        estimated = preflight_affected_rows(df, norm)
         try:
             new_df, rows_changed = apply_proposal(df, norm)
         except TransformError as exc:
@@ -229,6 +421,7 @@ async def ai_apply(request: ApplyRequest) -> ApplyResponse:
             continue
 
         dirty_tables[table_name] = new_df
+        normalized_for_scan.append(norm)
         applied.append(
             ApplyResultItem(
                 id=norm["id"],
@@ -238,6 +431,8 @@ async def ai_apply(request: ApplyRequest) -> ApplyResponse:
                 risk=norm["risk"],
                 rows_changed=rows_changed,
                 rows_after=new_df.height,
+                estimated_affected_rows=estimated,
+                coverage_note=coverage_note(estimated, df.height),
             )
         )
 
@@ -293,4 +488,5 @@ async def ai_apply(request: ApplyRequest) -> ApplyResponse:
         skipped=skipped,
         errors=errors,
         table_summaries=table_summaries,
+        remaining_anomalies=_post_apply_scan(dirty_tables, normalized_for_scan),
     )

@@ -1,7 +1,7 @@
 'use client'
 
 import { useState } from 'react'
-import { Check, X, Code2, ChevronDown, ChevronUp } from 'lucide-react'
+import { Check, X, Code2, ChevronDown, ChevronUp, Database } from 'lucide-react'
 import type { Proposal } from '@/lib/api'
 import { RISK_META } from '@/lib/proposals'
 
@@ -11,10 +11,18 @@ interface ProposalCardProps {
   onToggle: (id: string, approved: boolean) => void
 }
 
+function formatRows(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`
+  return n.toString()
+}
+
 export default function ProposalCard({ proposal, approved, onToggle }: ProposalCardProps) {
   const meta = RISK_META[proposal.risk] || RISK_META.medium
   const [showParams, setShowParams] = useState(false)
   const hasParams = proposal.params && Object.keys(proposal.params).length > 0
+  const coverage = proposal.coverage_note
+  const estimated = proposal.estimated_affected_rows
 
   return (
     <div
@@ -35,6 +43,16 @@ export default function ProposalCard({ proposal, approved, onToggle }: ProposalC
               <span className="text-[10px] uppercase tracking-widest font-mono text-text-muted">
                 {proposal.action}
               </span>
+              {typeof estimated === 'number' && estimated > 0 && (
+                <span
+                  className="text-[10px] uppercase tracking-widest font-mono px-1.5 py-0.5 rounded border bg-bg-secondary border-border text-text-secondary"
+                  title={coverage || `~${estimated} filas afectadas estimadas`}
+                  data-testid={`proposal-coverage-${proposal.id}`}
+                >
+                  <Database className="w-3 h-3 inline-block mr-1 -mt-0.5" />
+                  {coverage || `~${formatRows(estimated)} filas`}
+                </span>
+              )}
             </div>
             <h4 className="font-semibold text-sm text-text-primary break-words">
               {proposal.title}

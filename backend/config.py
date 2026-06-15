@@ -21,6 +21,15 @@ try:
 except ValueError:
     DEEPSEEK_TIMEOUT = 60
 
+try:
+    DEEPSEEK_MAX_INPUT_TOKENS: int = int(os.getenv("DEEPSEEK_MAX_INPUT_TOKENS", "32768"))
+except ValueError:
+    DEEPSEEK_MAX_INPUT_TOKENS = 32768
+
 
 def is_ai_enabled() -> bool:
     return bool(DEEPSEEK_API_KEY)
+
+
+def get_max_input_tokens() -> int:
+    return DEEPSEEK_MAX_INPUT_TOKENS
